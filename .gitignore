@@ -1,0 +1,4 @@
+Clipstack.app/
+*.o
+.DS_Store
+/_old-chrome-extension-prototype/
