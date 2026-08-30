@@ -1,9 +1,11 @@
 # Clipstack
 
-A tiny floating clipboard manager for macOS — a pill that sits in a screen corner,
+A tiny floating clipboard manager for macOS — a pill that sits at a screen edge,
 expands to show up to 10 saved snippets, and copies any of them back out with one click.
 
-- Snaps to whichever of the four screen corners you drag it nearest to
+- Drag it by the ⠿ grip on its left edge; it snaps to whichever of seven edge spots
+  you let go nearest — the four corners, both side middles, and bottom centre
+  (top centre belongs to the menu bar)
 - ⌘⇧⌃V (or the on-screen + button) saves the current clipboard
 - Skips concealed pasteboard content (password managers mark their entries this way)
 - No dependencies — AppKit only

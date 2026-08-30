@@ -2,7 +2,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swiftc -O Store.swift test.swift -o /tmp/clipstack-test && /tmp/clipstack-test
+# Two lines, not `&&`: set -e is suppressed inside an AND list, so a failing
+# test would build the app anyway.
+swiftc -O Store.swift test.swift -o /tmp/clipstack-test
+/tmp/clipstack-test
 
 APP="Clipstack.app"
 rm -rf "$APP"

@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 let maxItems = 10
 
@@ -46,4 +47,59 @@ final class Store {
     }
 
     private func save() { defaults.set(items, forKey: key) }
+}
+
+// MARK: - Screen anchoring
+
+let margin: CGFloat = 16
+
+/// visibleFrame already excludes a pinned Dock, but an auto-hidden one reserves
+/// nothing and still draws above floating panels when revealed — so clear it.
+let bottomMargin: CGFloat = {
+    let dock = UserDefaults(suiteName: "com.apple.dock")
+    let hidden = dock?.bool(forKey: "autohide") ?? false
+    let atBottom = (dock?.string(forKey: "orientation") ?? "bottom") == "bottom"
+    return hidden && atBottom ? 80 : margin
+}()
+
+/// The seven places the panel can park: both side edges at three heights each,
+/// minus top-centre, which belongs to the menu bar and the notch.
+enum Anchor: Int, CaseIterable {
+    // ponytail: raw values 0–3 are frozen — they are what is already sitting in
+    // UserDefaults from the four-corner version. New spots append.
+    case bottomLeft, bottomRight, topLeft, topRight, leftMiddle, rightMiddle, bottomMiddle
+
+    /// Where this spot sits in the usable area, 0…1 on each axis.
+    private var unit: (x: CGFloat, y: CGFloat) {
+        switch self {
+        case .bottomLeft:   return (0, 0)
+        case .bottomMiddle: return (0.5, 0)
+        case .bottomRight:  return (1, 0)
+        case .leftMiddle:   return (0, 0.5)
+        case .rightMiddle:  return (1, 0.5)
+        case .topLeft:      return (0, 1)
+        case .topRight:     return (1, 1)
+        }
+    }
+
+    /// Where a panel of `size` sits when parked here.
+    func frame(for size: NSSize, in area: NSRect) -> NSRect {
+        let slackX = max(0, area.width - size.width - 2 * margin)
+        let slackY = max(0, area.height - size.height - margin - bottomMargin)
+        return NSRect(x: area.minX + margin + slackX * unit.x,
+                      y: area.minY + bottomMargin + slackY * unit.y,
+                      width: size.width,
+                      height: size.height)
+    }
+
+    /// The spot whose resting place is closest to where the panel was dropped.
+    /// ponytail: recomputes each distance per comparison — seven spots, once per drag.
+    static func nearest(to frame: NSRect, in area: NSRect) -> Anchor {
+        allCases.min { $0.distance(to: frame, in: area) < $1.distance(to: frame, in: area) } ?? .bottomRight
+    }
+
+    private func distance(to dropped: NSRect, in area: NSRect) -> CGFloat {
+        let rest = frame(for: dropped.size, in: area)
+        return hypot(rest.midX - dropped.midX, rest.midY - dropped.midY)
+    }
 }

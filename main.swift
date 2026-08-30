@@ -21,6 +21,17 @@ func symbolButton(_ name: String, size: CGFloat = 12, describedAs: String? = nil
     return button
 }
 
+/// The grip. `performDrag` runs its own tracking loop and returns when the mouse
+/// comes up, which is an exact drag-end signal — no global monitor guessing at one.
+final class DragHandle: NSImageView {
+    var onDragEnd: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+        onDragEnd?()
+    }
+}
+
 func label(_ text: String, size: CGFloat, alpha: CGFloat = 1) -> NSTextField {
     let field = NSTextField(labelWithString: text)
     field.font = .systemFont(ofSize: size, weight: .regular)
@@ -59,52 +70,18 @@ private func registerHotKey(keyCode: UInt32, modifiers: UInt32, action: @escapin
 
 // MARK: - App
 
-let collapsedSize = NSSize(width: 52, height: 48)
+let collapsedSize = NSSize(width: 76, height: 48)   // insets + grip + toggle
 let expandedWidth: CGFloat = 300
 private let rowHeight: CGFloat = 26
 private let iconSide: CGFloat = 28
+private let gripWidth: CGFloat = 16
 private let expandedKey = "clipstack.expanded"
-private let cornerKey = "clipstack.corner"
-private let margin: CGFloat = 16
+// ponytail: key string unchanged so an existing saved spot survives the rename.
+private let anchorKey = "clipstack.corner"
 // Cmd+Shift+Ctrl+V. Cmd+Shift+V is Paste and Match Style, which is not ours to take.
 private let hotKeyCode = UInt32(kVK_ANSI_V)
 private let hotKeyMods = UInt32(cmdKey | shiftKey | controlKey)
 private let hotKeyHint = "⌘⇧⌃V"
-
-enum Corner: Int {
-    case bottomLeft, bottomRight, topLeft, topRight
-
-    var isLeft: Bool { self == .bottomLeft || self == .topLeft }
-    var isBottom: Bool { self == .bottomLeft || self == .bottomRight }
-
-    static func nearest(to frame: NSRect, in area: NSRect) -> Corner {
-        switch (frame.midY < area.midY, frame.midX < area.midX) {
-        case (true, true):   return .bottomLeft
-        case (true, false):  return .bottomRight
-        case (false, true):  return .topLeft
-        case (false, false): return .topRight
-        }
-    }
-
-    /// Where a panel of `size` sits when parked in this corner.
-    func frame(for size: NSSize, in area: NSRect) -> NSRect {
-        NSRect(
-            x: isLeft ? area.minX + margin : area.maxX - size.width - margin,
-            y: isBottom ? area.minY + bottomMargin : area.maxY - size.height - margin,
-            width: size.width,
-            height: size.height
-        )
-    }
-}
-
-/// visibleFrame already excludes a pinned Dock, but an auto-hidden one reserves
-/// nothing and still draws above floating panels when revealed — so clear it.
-private let bottomMargin: CGFloat = {
-    let dock = UserDefaults(suiteName: "com.apple.dock")
-    let hidden = dock?.bool(forKey: "autohide") ?? false
-    let atBottom = (dock?.string(forKey: "orientation") ?? "bottom") == "bottom"
-    return hidden && atBottom ? 80 : margin
-}()
 
 private func fix(_ view: NSView, _ width: CGFloat, _ height: CGFloat) {
     view.translatesAutoresizingMaskIntoConstraints = false
@@ -121,12 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // after that it reopens however you left it.
     var expanded = UserDefaults.standard.object(forKey: expandedKey) as? Bool ?? true
     // object(forKey:), not integer(forKey:) — the latter returns 0 when unset,
-    // which is a valid Corner and would swallow the default.
-    var corner = (UserDefaults.standard.object(forKey: cornerKey) as? Int)
-        .flatMap(Corner.init(rawValue:)) ?? .bottomRight
-    private var mouseUpMonitor: Any?
-    /// Where resizePanel/snap last put the panel — the reference for "did it move?".
-    private var parkedOrigin: NSPoint = .zero
+    // which is a valid Anchor and would swallow the default.
+    var anchor = (UserDefaults.standard.object(forKey: anchorKey) as? Int)
+        .flatMap(Anchor.init(rawValue:)) ?? .bottomRight
 
     private var root: NSStackView!
     private var listStack: NSStackView!
@@ -147,7 +121,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
 
@@ -170,7 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         backdrop.menu = menu
 
         buildViews(in: backdrop)
-        render()          // render() parks it in `corner` via resizePanel
+        render()          // render() parks it in `anchor` via resizePanel
         panel.orderFrontRegardless()
 
         if !registerHotKey(keyCode: hotKeyCode, modifiers: hotKeyMods, action: { [weak self] in
@@ -180,20 +153,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             FileHandle.standardError.write("Clipstack: \(hotKeyHint) is already taken\n".data(using: .utf8)!)
             show(flash: "hotkey in use")
         }
-
-        // Drag freely, snap on release. There's no windowDidEndMove callback, so
-        // the mouse-up is the drag-end signal.
-        mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] event in
-            // Fires on every click in the app, not just drags, so only do the
-            // work when the panel has actually left where we parked it.
-            if let self, self.panel.frame.origin != self.parkedOrigin {
-                self.snapToNearestCorner()
-            }
-            return event
-        }
     }
 
     private func buildViews(in container: NSView) {
+        let grip = DragHandle()
+        grip.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag to move")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
+        grip.contentTintColor = NSColor.white.withAlphaComponent(0.45)
+        grip.toolTip = "Drag to move"
+        grip.menu = container.menu      // keep right-click-to-quit working over the grip
+        grip.onDragEnd = { [weak self] in self?.snapToNearestAnchor() }
+        fix(grip, gripWidth, iconSide)
+
         let toggle = symbolButton("list.clipboard.fill", size: 15,
                                   describedAs: "Show or hide saved clips",
                                   target: self, action: #selector(toggleExpanded))
@@ -211,7 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
-        let header = NSStackView(views: [toggle, plusButton, countLabel, spacer, flash])
+        let header = NSStackView(views: [grip, toggle, plusButton, countLabel, spacer, flash])
         header.orientation = .horizontal
         header.spacing = 8
         header.alignment = .centerY
@@ -361,13 +332,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return stack
     }
 
-    /// Resizes in place and re-parks in the current corner, so the panel grows
+    /// Resizes in place and re-parks on the current anchor, so the panel grows
     /// away from whichever screen edges it's pinned to.
     private func resizePanel() {
         let width = expanded ? expandedWidth : collapsedSize.width
 
         // Width has to land before measuring: fittingSize asks the labels how tall
-        // they are at the *current* width, and at the collapsed 52pt they all lie.
+        // they are at the *current* width, and at the collapsed 76pt they all lie.
         panel.setFrame(NSRect(origin: panel.frame.origin, size: NSSize(width: width, height: panel.frame.height)),
                        display: false)
         panel.layoutIfNeeded()
@@ -377,23 +348,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : collapsedSize.height
 
         guard let area = visibleArea else { return }
-        let target = corner.frame(for: NSSize(width: width, height: height), in: area)
+        let target = anchor.frame(for: NSSize(width: width, height: height), in: area)
         panel.setFrame(target, display: true)
-        parkedOrigin = target.origin
     }
 
     private var visibleArea: NSRect? { (panel.screen ?? NSScreen.main)?.visibleFrame }
 
-    private func snapToNearestCorner() {
+    private func snapToNearestAnchor() {
         guard let area = visibleArea else { return }
-        let landed = Corner.nearest(to: panel.frame, in: area)
-        if landed != corner {
-            corner = landed
-            UserDefaults.standard.set(landed.rawValue, forKey: cornerKey)
+        let landed = Anchor.nearest(to: panel.frame, in: area)
+        if landed != anchor {
+            anchor = landed
+            UserDefaults.standard.set(landed.rawValue, forKey: anchorKey)
         }
         let target = landed.frame(for: panel.frame.size, in: area)
         if target != panel.frame { panel.setFrame(target, display: true, animate: true) }
-        parkedOrigin = target.origin
     }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 @main
 struct StoreTests {
@@ -49,6 +50,28 @@ struct StoreTests {
         check(clipAction(concealed: false, hasContents: true, string: "  hi  ") == .save("hi"),
               "real text saves, trimmed")
 
-        print("ok — \(maxItems)-item cap, dedupe, trim, persistence, clip guard")
+        // Anchor geometry — the seven parking spots
+        let screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let pill = NSSize(width: 52, height: 48)
+
+        check(Anchor.allCases.count == 7, "seven spots, got \(Anchor.allCases.count)")
+        for spot in Anchor.allCases {
+            let parked = spot.frame(for: pill, in: screen)
+            check(screen.contains(parked), "\(spot) parks fully on screen")
+            check(Anchor.nearest(to: parked, in: screen) == spot, "\(spot) re-snaps to itself")
+        }
+        // Dropping near an edge picks the spot on it, not the corner beyond it.
+        check(Anchor.nearest(to: NSRect(x: 20, y: 430, width: 52, height: 48), in: screen) == .leftMiddle,
+              "left edge, mid height → leftMiddle")
+        check(Anchor.nearest(to: NSRect(x: 700, y: 10, width: 52, height: 48), in: screen) == .bottomMiddle,
+              "bottom centre → bottomMiddle")
+        // No top-centre spot: a drop up there falls to the nearer top corner.
+        check(Anchor.nearest(to: NSRect(x: 600, y: 860, width: 52, height: 48), in: screen) == .topLeft,
+              "top centre has no spot → nearer top corner")
+        // A panel wider than the screen's slack still lands inside it.
+        check(Anchor.rightMiddle.frame(for: NSSize(width: 5000, height: 48), in: screen).minX == margin,
+              "oversized panel clamps to the left margin instead of flying off")
+
+        print("ok — \(maxItems)-item cap, dedupe, trim, persistence, clip guard, \(Anchor.allCases.count) anchors")
     }
 }
