@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import QuartzCore
 
 let maxItems = 10
 
@@ -51,17 +52,6 @@ final class Store {
 
 // MARK: - Screen anchoring
 
-let margin: CGFloat = 16
-
-/// visibleFrame already excludes a pinned Dock, but an auto-hidden one reserves
-/// nothing and still draws above floating panels when revealed — so clear it.
-let bottomMargin: CGFloat = {
-    let dock = UserDefaults(suiteName: "com.apple.dock")
-    let hidden = dock?.bool(forKey: "autohide") ?? false
-    let atBottom = (dock?.string(forKey: "orientation") ?? "bottom") == "bottom"
-    return hidden && atBottom ? 80 : margin
-}()
-
 /// The seven places the panel can park: both side edges at three heights each,
 /// minus top-centre, which belongs to the menu bar and the notch.
 enum Anchor: Int, CaseIterable {
@@ -82,14 +72,25 @@ enum Anchor: Int, CaseIterable {
         }
     }
 
-    /// Where a panel of `size` sits when parked here.
+    /// Where a panel of `size` sits when parked here — flush into the edges, no inset.
     func frame(for size: NSSize, in area: NSRect) -> NSRect {
-        let slackX = max(0, area.width - size.width - 2 * margin)
-        let slackY = max(0, area.height - size.height - margin - bottomMargin)
-        return NSRect(x: area.minX + margin + slackX * unit.x,
-                      y: area.minY + bottomMargin + slackY * unit.y,
-                      width: size.width,
-                      height: size.height)
+        NSRect(x: area.minX + max(0, area.width - size.width) * unit.x,
+               y: area.minY + max(0, area.height - size.height) * unit.y,
+               width: size.width,
+               height: size.height)
+    }
+
+    /// The corners to round: every one not sitting on a screen edge the pill is
+    /// flush against, so each flush side stays a straight, unbroken line.
+    /// Layer coords, so minY is the bottom — NSVisualEffectView isn't flipped.
+    var roundedCorners: CACornerMask {
+        var mask: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
+                                  .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        if unit.x == 0 { mask.subtract([.layerMinXMinYCorner, .layerMinXMaxYCorner]) }   // flush left
+        if unit.x == 1 { mask.subtract([.layerMaxXMinYCorner, .layerMaxXMaxYCorner]) }   // flush right
+        if unit.y == 0 { mask.subtract([.layerMinXMinYCorner, .layerMaxXMinYCorner]) }   // flush bottom
+        if unit.y == 1 { mask.subtract([.layerMinXMaxYCorner, .layerMaxXMaxYCorner]) }   // flush top
+        return mask
     }
 
     /// The spot whose resting place is closest to where the panel was dropped.

@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import QuartzCore
 
 extension NSPasteboard.PasteboardType {
     /// nspasteboard.org convention: password managers set this so clipboard
@@ -21,25 +22,67 @@ func symbolButton(_ name: String, size: CGFloat = 12, describedAs: String? = nil
     return button
 }
 
-/// The grip. `performDrag` runs its own tracking loop and returns when the mouse
-/// comes up, which is an exact drag-end signal — no global monitor guessing at one.
+/// The grip. Not `performDrag`: that moves the window to the cursor, and the pill
+/// is only ever allowed to sit on an anchor. So we run the drag loop ourselves and
+/// hand out the *ghost* frame — where a freely-dragged panel would be — leaving the
+/// delegate to park on the nearest spot to it.
 final class DragHandle: NSImageView {
+    var onDrag: ((NSRect) -> Void)?
     var onDragEnd: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
-        window?.performDrag(with: event)
+        guard let window else { return }
+        // Where in the pill it was grabbed. Fixed for the whole drag, so the ghost
+        // tracks the cursor even as the real panel teleports out from under it.
+        let start = NSEvent.mouseLocation
+        let grab = NSPoint(x: start.x - window.frame.minX, y: start.y - window.frame.minY)
+        let size = window.frame.size
+
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            if next.type == .leftMouseUp { break }
+            let mouse = NSEvent.mouseLocation
+            onDrag?(NSRect(x: mouse.x - grab.x, y: mouse.y - grab.y,
+                           width: size.width, height: size.height))
+        }
         onDragEnd?()
     }
 }
 
+/// Labels take no clicks. With the pill's whole body acting as the expand target,
+/// a label sitting on top of it would swallow the click before the backdrop saw it.
+/// Tooltips move to the enclosing view, which still gets the hit.
+final class PassThroughLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// The pill's body is the way back out of the collapsed state.
+final class ClickToExpand: NSVisualEffectView {
+    var onClick: (() -> Void)?
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
 func label(_ text: String, size: CGFloat, alpha: CGFloat = 1) -> NSTextField {
-    let field = NSTextField(labelWithString: text)
+    let field = PassThroughLabel(labelWithString: text)
     field.font = .systemFont(ofSize: size, weight: .regular)
     field.textColor = NSColor.white.withAlphaComponent(alpha)
     field.lineBreakMode = .byTruncatingTail
     field.maximumNumberOfLines = 1
     field.cell?.truncatesLastVisibleLine = true
     return field
+}
+
+/// `setFrame(display:animate:)` is synchronous, and synchronous is the only kind
+/// of animation that runs inside the grip's blocking event loop. Its stock duration
+/// scales with the size change — far too slow for a drag — so pin it short.
+final class SnapPanel: NSPanel {
+    override func animationResizeTime(_ newFrame: NSRect) -> TimeInterval { 0.09 }
+}
+
+/// How the panel travels to a new frame.
+private enum Move {
+    case cut        // first layout: no previous frame to move from
+    case unfold     // expand/collapse, growing out of the anchored corner
+    case hop        // mid-drag jump between anchors
 }
 
 // MARK: - Global hotkey
@@ -70,7 +113,7 @@ private func registerHotKey(keyCode: UInt32, modifiers: UInt32, action: @escapin
 
 // MARK: - App
 
-let collapsedSize = NSSize(width: 76, height: 48)   // insets + grip + toggle
+let collapsedSize = NSSize(width: 72, height: 48)   // insets + grip + count
 let expandedWidth: CGFloat = 300
 private let rowHeight: CGFloat = 26
 private let iconSide: CGFloat = 28
@@ -107,11 +150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var plusButton: NSButton!
     private var countLabel: NSTextField!
     private var flash: NSTextField!
+    private var closeButton: NSButton!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
 
-        panel = NSPanel(
+        panel = SnapPanel(
             contentRect: NSRect(origin: .zero, size: collapsedSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -120,11 +164,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.level = .floating
         panel.isOpaque = false
         panel.backgroundColor = .clear
-        panel.hasShadow = true
+        panel.hasShadow = false     // its halo is square, so it reads as a box round the pill
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
 
-        let backdrop = NSVisualEffectView()
+        let backdrop = ClickToExpand()
+        backdrop.onClick = { [weak self] in self?.setExpanded(true) }
         backdrop.material = .hudWindow
         backdrop.blendingMode = .behindWindow
         backdrop.state = .active
@@ -132,9 +177,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         backdrop.layer?.cornerRadius = 16
         backdrop.layer?.cornerCurve = .continuous
         backdrop.layer?.masksToBounds = true
-        // Hairline edge so the pill reads against a dark wallpaper too.
-        backdrop.layer?.borderWidth = 1
-        backdrop.layer?.borderColor = NSColor(white: 1, alpha: 0.22).cgColor
         panel.contentView = backdrop
 
         // Right-click anywhere to quit.
@@ -162,14 +204,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grip.contentTintColor = NSColor.white.withAlphaComponent(0.45)
         grip.toolTip = "Drag to move"
         grip.menu = container.menu      // keep right-click-to-quit working over the grip
-        grip.onDragEnd = { [weak self] in self?.snapToNearestAnchor() }
+        grip.onDrag = { [weak self] ghost in self?.park(nearestTo: ghost) }
+        // One write per drag rather than one per hop.
+        grip.onDragEnd = { [weak self] in
+            guard let self else { return }
+            UserDefaults.standard.set(self.anchor.rawValue, forKey: anchorKey)
+        }
         fix(grip, gripWidth, iconSide)
 
-        let toggle = symbolButton("list.clipboard.fill", size: 15,
-                                  describedAs: "Show or hide saved clips",
-                                  target: self, action: #selector(toggleExpanded))
-        toggle.toolTip = "Show or hide saved clips"
-        fix(toggle, iconSide, iconSide)
+        closeButton = symbolButton("xmark", size: 11, describedAs: "Minimize",
+                                   target: self, action: #selector(minimize))
+        closeButton.toolTip = "Minimize"
+        closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.55)
+        fix(closeButton, iconSide, iconSide)
 
         plusButton = symbolButton("plus.circle.fill", size: 16, target: self, action: #selector(saveClipboard))
         plusButton.toolTip = "Save what's on the clipboard  (\(hotKeyHint))"
@@ -178,11 +225,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         countLabel = label("", size: 11, alpha: 0.55)
         flash = label("", size: 11, alpha: 0.9)
         flash.alignment = .right
+        flash.alphaValue = 0        // faded up by show(flash:)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
-        let header = NSStackView(views: [grip, toggle, plusButton, countLabel, spacer, flash])
+        let header = NSStackView(views: [grip, plusButton, countLabel, spacer, flash, closeButton])
         header.orientation = .horizontal
         header.spacing = 8
         header.alignment = .centerY
@@ -213,12 +261,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: Actions
 
-    @objc private func toggleExpanded() { setExpanded(!expanded) }
+    @objc private func minimize() { setExpanded(false) }
 
     private func setExpanded(_ on: Bool) {
         guard expanded != on else { return }
         expanded = on
         UserDefaults.standard.set(on, forKey: expandedKey)
+
+        guard on else {
+            // Fade the rows out *before* tearing them down, or they blink out of
+            // existence a beat ahead of the box that's supposed to contain them.
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.12
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeIn)
+                self.listStack.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in self?.render() })
+            return
+        }
+        listStack.alphaValue = 0    // the unfold fades it back up
         render()
     }
 
@@ -240,7 +300,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .skip(let why):
             show(flash: why)
         case .save(let text):
-            if store.add(text) { render() } else { show(flash: "already saved") }
+            if store.add(text) { render(newRow: true) } else { show(flash: "already saved") }
         }
     }
 
@@ -258,28 +318,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func show(flash text: String) {
         flash.stringValue = text
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            self.flash.animator().alphaValue = 1
+        }
         // ponytail: token check beats cancelling a timer — later flashes just win.
         let token = text + String(Date().timeIntervalSince1970)
         flashToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
             guard let self, self.flashToken == token else { return }
-            self.flash.stringValue = ""
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.3
+                self.flash.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                // Re-check: a flash raised during the fade owns the label now.
+                guard let self, self.flashToken == token else { return }
+                self.flash.stringValue = ""
+            })
         }
     }
     private var flashToken = ""
+    /// The first layout has no previous frame to animate from.
+    private var hasLaidOut = false
 
     // MARK: Render
 
-    private func render() {
+    private func render(newRow: Bool = false) {
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         plusButton.isHidden = !expanded
-        countLabel.isHidden = !expanded
         flash.isHidden = !expanded
         listStack.isHidden = !expanded
+        closeButton.isHidden = !expanded
+        // Bare count when collapsed — it's all the pill has room to say.
+        countLabel.stringValue = expanded ? "\(store.items.count)/\(maxItems)" : "\(store.items.count)"
 
         if expanded {
-            countLabel.stringValue = "\(store.items.count)/\(maxItems)"
-
             if store.items.isEmpty {
                 let hint = label("Copy something, then hit + or \(hotKeyHint)", size: 11, alpha: 0.45)
                 listStack.addArrangedSubview(hint)
@@ -292,12 +365,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // Purely presentational: from/to only, model values are already final, so
+        // there is no state to put back afterwards.
+        if newRow, let layer = listStack.arrangedSubviews.first?.layer {
+            let slide = CABasicAnimation(keyPath: "transform.translation.y")
+            slide.fromValue = 10        // starts above its slot and drops in
+            slide.toValue = 0
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0
+            fade.toValue = 1
+            for step in [slide, fade] {
+                step.duration = 0.24
+                step.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                layer.add(step, forKey: step.keyPath)
+            }
+        }
+
         resizePanel()
     }
 
     private func row(index: Int, text: String) -> NSView {
         let preview = label(text.replacingOccurrences(of: "\n", with: " "), size: 12, alpha: 0.92)
-        preview.toolTip = text
         // Low hugging = the label soaks up the spare width, so the buttons stay
         // pinned right instead of trailing short text.
         preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -323,6 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.distribution = .fill
         // ponytail: explicit row height — NSStackView.edgeInsets doesn't survive
         // being measured through a parent stack's fittingSize, rows come out 16pt.
+        stack.toolTip = text        // on the row, not the click-through label
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 6)
         stack.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
         stack.wantsLayer = true
@@ -335,11 +424,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Resizes in place and re-parks on the current anchor, so the panel grows
     /// away from whichever screen edges it's pinned to.
     private func resizePanel() {
+        let start = panel.frame
+        guard let area = area(under: NSPoint(x: start.midX, y: start.midY)) else { return }
         let width = expanded ? expandedWidth : collapsedSize.width
 
         // Width has to land before measuring: fittingSize asks the labels how tall
-        // they are at the *current* width, and at the collapsed 76pt they all lie.
-        panel.setFrame(NSRect(origin: panel.frame.origin, size: NSSize(width: width, height: panel.frame.height)),
+        // they are at the *current* width, and at the collapsed 72pt they all lie.
+        panel.setFrame(NSRect(origin: start.origin, size: NSSize(width: width, height: start.height)),
                        display: false)
         panel.layoutIfNeeded()
 
@@ -347,22 +438,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? max(collapsedSize.height, root.fittingSize.height)
             : collapsedSize.height
 
-        guard let area = visibleArea else { return }
-        let target = anchor.frame(for: NSSize(width: width, height: height), in: area)
-        panel.setFrame(target, display: true)
+        // Rewind. That measuring resize is not where the animation should start
+        // from — leave it in place and the width snaps while only the height eases.
+        panel.setFrame(start, display: false)
+        place(anchor.frame(for: NSSize(width: width, height: height), in: area),
+              on: anchor, hasLaidOut ? .unfold : .cut)
+        hasLaidOut = true
     }
 
-    private var visibleArea: NSRect? { (panel.screen ?? NSScreen.main)?.visibleFrame }
-
-    private func snapToNearestAnchor() {
-        guard let area = visibleArea else { return }
-        let landed = Anchor.nearest(to: panel.frame, in: area)
-        if landed != anchor {
-            anchor = landed
-            UserDefaults.standard.set(landed.rawValue, forKey: anchorKey)
+    /// Moves the panel and reshapes it — corners on a flush screen edge go square.
+    private func place(_ target: NSRect, on spot: Anchor, _ move: Move) {
+        anchor = spot
+        panel.contentView?.layer?.maskedCorners = spot.roundedCorners
+        switch move {
+        case .cut:
+            panel.setFrame(target, display: true)
+        case .hop:
+            panel.setFrame(target, display: true, animate: true)     // SnapPanel pins this to 0.09s
+        case .unfold:
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                self.panel.animator().setFrame(target, display: true)
+                self.listStack.animator().alphaValue = 1
+            }
         }
+    }
+
+    /// The screen a point is over, so a drag can carry the pill to another display.
+    private func area(under point: NSPoint) -> NSRect? {
+        (NSScreen.screens.first { $0.frame.contains(point) } ?? panel.screen ?? NSScreen.main)?.visibleFrame
+    }
+
+    /// Jumps to the anchor nearest the ghost. Runs on every drag event, so the pill
+    /// hops from spot to spot and is never parked anywhere else.
+    private func park(nearestTo ghost: NSRect) {
+        guard let area = area(under: NSPoint(x: ghost.midX, y: ghost.midY)) else { return }
+        let landed = Anchor.nearest(to: ghost, in: area)
         let target = landed.frame(for: panel.frame.size, in: area)
-        if target != panel.frame { panel.setFrame(target, display: true, animate: true) }
+        guard target != panel.frame else { return }
+        place(target, on: landed, .hop)
     }
 }
 

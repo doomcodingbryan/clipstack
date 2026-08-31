@@ -58,6 +58,9 @@ struct StoreTests {
         for spot in Anchor.allCases {
             let parked = spot.frame(for: pill, in: screen)
             check(screen.contains(parked), "\(spot) parks fully on screen")
+            let flush = parked.minX == screen.minX || parked.maxX == screen.maxX
+                     || parked.minY == screen.minY || parked.maxY == screen.maxY
+            check(flush, "\(spot) sits flush against a screen edge")
             check(Anchor.nearest(to: parked, in: screen) == spot, "\(spot) re-snaps to itself")
         }
         // Dropping near an edge picks the spot on it, not the corner beyond it.
@@ -69,8 +72,17 @@ struct StoreTests {
         check(Anchor.nearest(to: NSRect(x: 600, y: 860, width: 52, height: 48), in: screen) == .topLeft,
               "top centre has no spot → nearer top corner")
         // A panel wider than the screen's slack still lands inside it.
-        check(Anchor.rightMiddle.frame(for: NSSize(width: 5000, height: 48), in: screen).minX == margin,
-              "oversized panel clamps to the left margin instead of flying off")
+        check(Anchor.rightMiddle.frame(for: NSSize(width: 5000, height: 48), in: screen).minX == screen.minX,
+              "oversized panel clamps to the screen edge instead of flying off")
+        // Square where it touches, rounded where it's exposed.
+        check(Anchor.bottomRight.roundedCorners == [.layerMinXMaxYCorner],
+              "bottom-right rounds only its exposed top-left corner")
+        check(Anchor.topLeft.roundedCorners == [.layerMaxXMinYCorner],
+              "top-left rounds only its exposed bottom-right corner")
+        check(Anchor.rightMiddle.roundedCorners == [.layerMinXMinYCorner, .layerMinXMaxYCorner],
+              "right-middle rounds its whole left side")
+        check(Anchor.bottomMiddle.roundedCorners == [.layerMinXMaxYCorner, .layerMaxXMaxYCorner],
+              "bottom-middle rounds its whole top side")
 
         print("ok — \(maxItems)-item cap, dedupe, trim, persistence, clip guard, \(Anchor.allCases.count) anchors")
     }
