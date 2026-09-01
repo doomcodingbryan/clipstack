@@ -8,6 +8,7 @@ expands to show up to 10 saved snippets, and copies any of them back out with on
   bottom centre (top centre belongs to the menu bar)
 - Sits flush in the edge, squaring off whichever corners land on one
 - Click the pill to open it, ✕ to minimize back down
+- Click any clip to copy it; each shows two wrapped lines of preview
 - ⌘⇧⌃V (or the on-screen + button) saves the current clipboard
 - Skips concealed pasteboard content (password managers mark their entries this way)
 - No dependencies — AppKit only

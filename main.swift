@@ -58,6 +58,62 @@ final class PassThroughLabel: NSTextField {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+/// The wash shown while dragging: the screen goes dark except for the seven spots
+/// the pill can land in, each outlined in a dotted line.
+final class ZoneView: NSView {
+    var spots: [NSRect] = [] { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let radius: CGFloat = 14
+
+        // One even-odd path — the screen with seven holes cut out of it. The holes
+        // are genuinely clear, so the desktop reads through them at full brightness
+        // instead of just being a lighter shade of the dim.
+        let dim = NSBezierPath(rect: bounds)
+        dim.windingRule = .evenOdd
+        for spot in spots {
+            dim.append(NSBezierPath(roundedRect: spot, xRadius: radius, yRadius: radius))
+        }
+        NSColor(white: 0, alpha: 0.45).setFill()
+        dim.fill()
+
+        let dash: [CGFloat] = [6, 5]
+        NSColor(white: 1, alpha: 0.85).setStroke()
+        for spot in spots {
+            // Inset by half the line width, or the stroke straddles the hole's edge.
+            let outline = NSBezierPath(roundedRect: spot.insetBy(dx: 1, dy: 1),
+                                       xRadius: radius, yRadius: radius)
+            outline.lineWidth = 2
+            outline.setLineDash(dash, count: dash.count, phase: 0)
+            outline.stroke()
+        }
+    }
+}
+
+/// A saved clip. The whole strip is the copy target — a far easier hit than the
+/// 22pt button it replaces, and the reclaimed width goes to the text.
+final class ClipRow: NSStackView {
+    var onClick: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) { onClick?() }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        // .activeAlways: the panel is non-activating and never key, so hover has to
+        // work without the app being frontmost.
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { lit(true) }
+    override func mouseExited(with event: NSEvent) { lit(false) }
+
+    private func lit(_ on: Bool) {
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(on ? 0.2 : 0.09).cgColor
+    }
+}
+
 /// The pill's body is the way back out of the collapsed state.
 final class ClickToExpand: NSVisualEffectView {
     var onClick: (() -> Void)?
@@ -118,8 +174,8 @@ private func registerHotKey(keyCode: UInt32, modifiers: UInt32, action: @escapin
 // MARK: - App
 
 let collapsedSize = NSSize(width: 72, height: 48)   // insets + grip + count
-let expandedWidth: CGFloat = 300
-private let rowHeight: CGFloat = 26
+let expandedWidth: CGFloat = 360
+private let rowHeight: CGFloat = 40   // two lines of preview
 private let iconSide: CGFloat = 28
 private let gripWidth: CGFloat = 16
 private let expandedKey = "clipstack.expanded"
@@ -210,10 +266,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grip.menu = container.menu      // keep right-click-to-quit working over the grip
         // Airborne it belongs to no anchor, so nothing is squared off against an edge.
         grip.onDragStart = { [weak self] in
-            self?.panel.contentView?.layer?.maskedCorners = Anchor.allCornersRounded
+            guard let self else { return }
+            self.panel.contentView?.layer?.maskedCorners = Anchor.allCornersRounded
+            self.showZones(pill: self.panel.frame.size, over: self.panel.frame)
         }
-        grip.onDrag = { [weak self] frame in self?.panel.setFrame(frame, display: true) }
-        grip.onDragEnd = { [weak self] in self?.settle() }
+        grip.onDrag = { [weak self] frame in
+            guard let self else { return }
+            self.panel.setFrame(frame, display: true)
+            self.showZones(pill: frame.size, over: frame)
+        }
+        grip.onDragEnd = { [weak self] in
+            self?.hideZones()
+            self?.settle()
+        }
         fix(grip, gripWidth, iconSide)
 
         closeButton = symbolButton("xmark", size: 11, describedAs: "Minimize",
@@ -230,6 +295,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         flash = label("", size: 11, alpha: 0.9)
         flash.alignment = .right
         flash.alphaValue = 0        // faded up by show(flash:)
+        // Lowest resistance in the header, so a long readback truncates itself
+        // instead of squeezing the count or the buttons.
+        flash.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -304,14 +372,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .skip(let why):
             show(flash: why)
         case .save(let text):
-            if store.add(text) { render(newRow: true) } else { show(flash: "already saved") }
+            guard store.add(text) else { return show(flash: "already saved") }
+            render(newRow: true)
+            show(flash: text, for: 2.2)     // read back exactly what got saved
         }
     }
 
-    @objc private func copyRow(_ sender: NSButton) {
-        guard store.items.indices.contains(sender.tag) else { return }
+    private func copy(_ index: Int) {
+        guard store.items.indices.contains(index) else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(store.items[sender.tag], forType: .string)
+        NSPasteboard.general.setString(store.items[index], forType: .string)
         show(flash: "copied")
     }
 
@@ -320,8 +390,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         render()
     }
 
-    private func show(flash text: String) {
-        flash.stringValue = text
+    private func show(flash text: String, for seconds: Double = 1.1) {
+        // One line only — a saved clip can be many.
+        flash.stringValue = text.replacingOccurrences(of: "\n", with: " ")
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.12
             self.flash.animator().alphaValue = 1
@@ -329,7 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // ponytail: token check beats cancelling a timer — later flashes just win.
         let token = text + String(Date().timeIntervalSince1970)
         flashToken = token
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
             guard let self, self.flashToken == token else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.3
@@ -344,6 +415,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var flashToken = ""
     /// The first layout has no previous frame to animate from.
     private var hasLaidOut = false
+    private var zonePanel: NSPanel?
+    private var zoneScreen: NSScreen?
+    private let zoneView = ZoneView()
 
     // MARK: Render
 
@@ -389,16 +463,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func row(index: Int, text: String) -> NSView {
+        // Newlines flatten to spaces on purpose: two wrapped lines of running text
+        // show far more of a snippet than its first two literal lines would.
         let preview = label(text.replacingOccurrences(of: "\n", with: " "), size: 12, alpha: 0.92)
+        preview.maximumNumberOfLines = 2
+        preview.usesSingleLineMode = false
+        preview.cell?.wraps = true
+        preview.cell?.isScrollable = false
         // Low hugging = the label soaks up the spare width, so the buttons stay
         // pinned right instead of trailing short text.
         preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
         preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let copy = symbolButton("doc.on.doc", size: 11, target: self, action: #selector(copyRow(_:)))
-        copy.tag = index
-        copy.toolTip = "Copy"
-        fix(copy, 22, 20)
 
         let trash = symbolButton("xmark", size: 10, target: self, action: #selector(deleteRow(_:)))
         trash.tag = index
@@ -406,7 +481,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trash.toolTip = "Delete"
         fix(trash, 18, 20)
 
-        let stack = NSStackView(views: [preview, copy, trash])
+        let stack = ClipRow(views: [preview, trash])
+        stack.onClick = { [weak self] in self?.copy(index) }
         stack.orientation = .horizontal
         stack.spacing = 6
         stack.alignment = .centerY
@@ -415,7 +491,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.distribution = .fill
         // ponytail: explicit row height — NSStackView.edgeInsets doesn't survive
         // being measured through a parent stack's fittingSize, rows come out 16pt.
-        stack.toolTip = text        // on the row, not the click-through label
+        stack.toolTip = text        // the untruncated text, on the row not the label
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 6)
         stack.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
         stack.wantsLayer = true
@@ -466,6 +542,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The screen a point is over, so a drag can carry the pill to another display.
     private func area(under point: NSPoint) -> NSRect? {
         (NSScreen.screens.first { $0.frame.contains(point) } ?? panel.screen ?? NSScreen.main)?.visibleFrame
+    }
+
+    /// Raises the drop-zone wash over whichever screen the pill is on. Cheap to call
+    /// on every drag event: it only redraws when the drag crosses to another display.
+    private func showZones(pill: NSSize, over frame: NSRect) {
+        let middle = NSPoint(x: frame.midX, y: frame.midY)
+        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(middle) })
+                ?? panel.screen ?? NSScreen.main else { return }
+        let zones = zonePanel ?? makeZonePanel()
+        guard screen != zoneScreen else { return }
+        zoneScreen = screen
+
+        zones.setFrame(screen.frame, display: false)
+        // Anchor frames are in screen coordinates; the view's are window-relative.
+        zoneView.spots = Anchor.allCases.map {
+            $0.frame(for: pill, in: screen.visibleFrame)
+                .offsetBy(dx: -screen.frame.minX, dy: -screen.frame.minY)
+        }
+        zones.alphaValue = 1
+        zones.order(.below, relativeTo: panel.windowNumber)      // never over the pill
+    }
+
+    private func makeZonePanel() -> NSPanel {
+        let zones = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: false)
+        zones.isOpaque = false
+        zones.backgroundColor = .clear
+        zones.hasShadow = false
+        // The drag loop has implicit capture of the mouse, so it keeps running
+        // underneath — but only if this thing never eats a click itself.
+        zones.ignoresMouseEvents = true
+        zones.level = .floating
+        zones.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        zones.contentView = zoneView
+        zonePanel = zones
+        return zones
+    }
+
+    /// Fades out as the pill falls. This runs after the drag loop has exited, so
+    /// unlike anything mid-drag it gets a runloop to animate on.
+    private func hideZones() {
+        zoneScreen = nil
+        guard let zones = zonePanel else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            zones.animator().alphaValue = 0
+        }, completionHandler: {
+            zones.orderOut(nil)
+            zones.alphaValue = 1
+        })
     }
 
     /// Let go: fall to the spot nearest wherever the pill was dropped, on whichever
