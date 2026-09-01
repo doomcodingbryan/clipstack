@@ -3,9 +3,9 @@
 A tiny floating clipboard manager for macOS — a pill that sits at a screen edge,
 expands to show up to 10 saved snippets, and copies any of them back out with one click.
 
-- Drag it by the ⠿ grip on its left edge. It hops between seven fixed spots —
-  the four corners, both side middles, and bottom centre (top centre belongs to
-  the menu bar) — and never rests anywhere in between
+- Drag it by the ⠿ grip on its left edge. It follows the cursor, then falls to the
+  nearest of seven spots when you let go — the four corners, both side middles, and
+  bottom centre (top centre belongs to the menu bar)
 - Sits flush in the edge, squaring off whichever corners land on one
 - Click the pill to open it, ✕ to minimize back down
 - ⌘⇧⌃V (or the on-screen + button) saves the current clipboard

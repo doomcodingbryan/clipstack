@@ -22,29 +22,32 @@ func symbolButton(_ name: String, size: CGFloat = 12, describedAs: String? = nil
     return button
 }
 
-/// The grip. Not `performDrag`: that moves the window to the cursor, and the pill
-/// is only ever allowed to sit on an anchor. So we run the drag loop ourselves and
-/// hand out the *ghost* frame — where a freely-dragged panel would be — leaving the
-/// delegate to park on the nearest spot to it.
+/// The grip. Deliberately not `performDrag`: that hands the drag to the window
+/// server and returns straight away, so the code after it fires on mouse-*down* and
+/// there is no "let go" moment left to fall from. Tracking the events here keeps the
+/// pill on the cursor and gives an exact drag-end signal.
 final class DragHandle: NSImageView {
+    var onDragStart: (() -> Void)?
     var onDrag: ((NSRect) -> Void)?
     var onDragEnd: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
-        // Where in the pill it was grabbed. Fixed for the whole drag, so the ghost
-        // tracks the cursor even as the real panel teleports out from under it.
+        // Where in the pill it was grabbed, so it doesn't jump to centre on the cursor.
         let start = NSEvent.mouseLocation
         let grab = NSPoint(x: start.x - window.frame.minX, y: start.y - window.frame.minY)
         let size = window.frame.size
+        var dragged = false
 
         while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
             if next.type == .leftMouseUp { break }
+            if !dragged { dragged = true; onDragStart?() }
             let mouse = NSEvent.mouseLocation
             onDrag?(NSRect(x: mouse.x - grab.x, y: mouse.y - grab.y,
                            width: size.width, height: size.height))
         }
-        onDragEnd?()
+        // A plain click on the grip isn't a drag — nothing to fall back from.
+        if dragged { onDragEnd?() }
     }
 }
 
@@ -71,18 +74,19 @@ func label(_ text: String, size: CGFloat, alpha: CGFloat = 1) -> NSTextField {
     return field
 }
 
-/// `setFrame(display:animate:)` is synchronous, and synchronous is the only kind
-/// of animation that runs inside the grip's blocking event loop. Its stock duration
-/// scales with the size change — far too slow for a drag — so pin it short.
-final class SnapPanel: NSPanel {
-    override func animationResizeTime(_ newFrame: NSRect) -> TimeInterval { 0.09 }
-}
-
 /// How the panel travels to a new frame.
 private enum Move {
     case cut        // first layout: no previous frame to move from
     case unfold     // expand/collapse, growing out of the anchored corner
-    case hop        // mid-drag jump between anchors
+    case settle     // let go of a drag, falling to the nearest spot
+
+    var duration: TimeInterval {
+        switch self {
+        case .cut:    return 0
+        case .unfold: return 0.18
+        case .settle: return 0.24
+        }
+    }
 }
 
 // MARK: - Global hotkey
@@ -155,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
 
-        panel = SnapPanel(
+        panel = NSPanel(
             contentRect: NSRect(origin: .zero, size: collapsedSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -204,12 +208,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grip.contentTintColor = NSColor.white.withAlphaComponent(0.45)
         grip.toolTip = "Drag to move"
         grip.menu = container.menu      // keep right-click-to-quit working over the grip
-        grip.onDrag = { [weak self] ghost in self?.park(nearestTo: ghost) }
-        // One write per drag rather than one per hop.
-        grip.onDragEnd = { [weak self] in
-            guard let self else { return }
-            UserDefaults.standard.set(self.anchor.rawValue, forKey: anchorKey)
+        // Airborne it belongs to no anchor, so nothing is squared off against an edge.
+        grip.onDragStart = { [weak self] in
+            self?.panel.contentView?.layer?.maskedCorners = Anchor.allCornersRounded
         }
+        grip.onDrag = { [weak self] frame in self?.panel.setFrame(frame, display: true) }
+        grip.onDragEnd = { [weak self] in self?.settle() }
         fix(grip, gripWidth, iconSide)
 
         closeButton = symbolButton("xmark", size: 11, describedAs: "Minimize",
@@ -450,18 +454,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func place(_ target: NSRect, on spot: Anchor, _ move: Move) {
         anchor = spot
         panel.contentView?.layer?.maskedCorners = spot.roundedCorners
-        switch move {
-        case .cut:
-            panel.setFrame(target, display: true)
-        case .hop:
-            panel.setFrame(target, display: true, animate: true)     // SnapPanel pins this to 0.09s
-        case .unfold:
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.18
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                self.panel.animator().setFrame(target, display: true)
-                self.listStack.animator().alphaValue = 1
-            }
+        guard move != .cut else { return panel.setFrame(target, display: true) }
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = move.duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.panel.animator().setFrame(target, display: true)
+            if move == .unfold { self.listStack.animator().alphaValue = 1 }
         }
     }
 
@@ -470,14 +468,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         (NSScreen.screens.first { $0.frame.contains(point) } ?? panel.screen ?? NSScreen.main)?.visibleFrame
     }
 
-    /// Jumps to the anchor nearest the ghost. Runs on every drag event, so the pill
-    /// hops from spot to spot and is never parked anywhere else.
-    private func park(nearestTo ghost: NSRect) {
-        guard let area = area(under: NSPoint(x: ghost.midX, y: ghost.midY)) else { return }
-        let landed = Anchor.nearest(to: ghost, in: area)
-        let target = landed.frame(for: panel.frame.size, in: area)
-        guard target != panel.frame else { return }
-        place(target, on: landed, .hop)
+    /// Let go: fall to the spot nearest wherever the pill was dropped, on whichever
+    /// screen it was dropped on.
+    private func settle() {
+        let middle = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
+        guard let area = area(under: middle) else { return }
+        let landed = Anchor.nearest(to: panel.frame, in: area)
+        place(landed.frame(for: panel.frame.size, in: area), on: landed, .settle)
+        UserDefaults.standard.set(landed.rawValue, forKey: anchorKey)
     }
 }
 

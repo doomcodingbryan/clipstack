@@ -80,12 +80,15 @@ enum Anchor: Int, CaseIterable {
                height: size.height)
     }
 
+    /// The shape in mid-drag, when the pill belongs to no anchor at all.
+    static let allCornersRounded: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
+                                                  .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+
     /// The corners to round: every one not sitting on a screen edge the pill is
     /// flush against, so each flush side stays a straight, unbroken line.
     /// Layer coords, so minY is the bottom — NSVisualEffectView isn't flipped.
     var roundedCorners: CACornerMask {
-        var mask: CACornerMask = [.layerMinXMinYCorner, .layerMaxXMinYCorner,
-                                  .layerMinXMaxYCorner, .layerMaxXMaxYCorner]
+        var mask = Anchor.allCornersRounded
         if unit.x == 0 { mask.subtract([.layerMinXMinYCorner, .layerMinXMaxYCorner]) }   // flush left
         if unit.x == 1 { mask.subtract([.layerMaxXMinYCorner, .layerMaxXMaxYCorner]) }   // flush right
         if unit.y == 0 { mask.subtract([.layerMinXMinYCorner, .layerMaxXMinYCorner]) }   // flush bottom
