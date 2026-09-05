@@ -1,16 +1,21 @@
 # Clipstack
 
-A tiny floating clipboard manager for macOS — a pill that sits at a screen edge,
-expands to show up to 10 saved snippets, and copies any of them back out with one click.
+A tiny floating snippet shelf for macOS — a pill that sits at a screen edge,
+expands to show up to 10 snippets you've typed in, and copies any of them back
+out with one click.
 
 - Drag it by the ⠿ grip on its left edge. It follows the cursor, then falls to the
   nearest of seven spots when you let go — the four corners, both side middles, and
   bottom centre (top centre belongs to the menu bar)
 - Sits flush in the edge, squaring off whichever corners land on one
 - Click the pill to open it, ✕ to minimize back down
-- Click any clip to copy it; each shows two wrapped lines of preview
-- ⌘⇧⌃V (or the on-screen + button) saves the current clipboard
-- Skips concealed pasteboard content (password managers mark their entries this way)
+- Clips are written in, not captured: + or ⌘⇧⌃V opens a text box, ⏎ saves
+- Click any clip to copy it out; each shows two wrapped lines of preview
+- ⌘⇧⌃1–9 (and ⌘⇧⌃0 for the tenth) copy a clip from anywhere, without looking
+- Double-click a clip to rewrite it in place, keeping its slot and shortcut
+- Drag a clip up or down to reorder it — that's how it gets a different shortcut
+- Pin a clip and the 10-clip cap will never drop it; evictions are announced, not silent
+- Right-click for Clear All Clips
 - No dependencies — AppKit only
 
 ## Build & run

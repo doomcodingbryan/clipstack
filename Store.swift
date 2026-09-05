@@ -4,41 +4,62 @@ import QuartzCore
 
 let maxItems = 10
 
-enum ClipAction: Equatable {
-    case save(String)
-    case skip(String)   // the message to flash
-}
-
-/// What a pasteboard's contents deserve. Pure and AppKit-free so test.swift can
-/// check the privacy guard without touching the real clipboard.
-func clipAction(concealed: Bool, hasContents: Bool, string: String?) -> ClipAction {
-    if concealed { return .skip("skipped — private") }
-    guard let string else { return .skip(hasContents ? "not text" : "clipboard empty") }
-    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-    return trimmed.isEmpty ? .skip("clipboard empty") : .save(trimmed)
+/// What became of a save. Five outcomes because there are five things worth
+/// telling someone, and "it silently dropped your oldest clip" is one of them.
+enum SaveResult: Equatable {
+    case blank                  // nothing typed
+    case saved                  // new, at the top
+    case movedUp                // already on the shelf; moved back to the top
+    case evicted(String)        // saved, and this fell off the end to make room
+    case full                   // at capacity with every clip pinned
 }
 
 final class Store {
-    private let key: String
     private let defaults: UserDefaults
+    private let key = "clipstack.items"
+    private let pinKey = "clipstack.pinned"
     var items: [String]
+    /// Pins keyed by text, not index — clips are unique by text, and this way
+    /// nothing already saved needs migrating.
+    private var pins: Set<String>
 
-    init(key: String = "clipstack.items", defaults: UserDefaults = .standard) {
-        self.key = key
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.items = defaults.stringArray(forKey: key) ?? []
+        self.pins = Set(defaults.stringArray(forKey: pinKey) ?? [])
     }
 
-    /// Returns false when there was nothing worth saving — blank, or already at the top.
-    @discardableResult
-    func add(_ raw: String) -> Bool {
-        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return false }
-        items.removeAll { $0 == text }          // re-saving moves it back to the top
-        items.insert(text, at: 0)
-        if items.count > maxItems { items.removeLast(items.count - maxItems) }
+    func isPinned(_ text: String) -> Bool { pins.contains(text) }
+
+    func togglePin(_ index: Int) {
+        guard items.indices.contains(index) else { return }
+        let text = items[index]
+        if pins.contains(text) { pins.remove(text) } else { pins.insert(text) }
         save()
-        return true
+    }
+
+    /// Puts `text` at the top, and says what that cost. A pinned clip is never the
+    /// one dropped to make room; if they all are, nothing is saved at all.
+    @discardableResult
+    func add(_ raw: String) -> SaveResult {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return .blank }
+
+        if items.contains(text) {
+            items.removeAll { $0 == text }
+            items.insert(text, at: 0)
+            save()
+            return .movedUp
+        }
+
+        var dropped: String?
+        if items.count >= maxItems {
+            guard let oldestLoose = items.lastIndex(where: { !pins.contains($0) }) else { return .full }
+            dropped = items.remove(at: oldestLoose)
+        }
+        items.insert(text, at: 0)
+        save()
+        return dropped.map(SaveResult.evicted) ?? .saved
     }
 
     func remove(_ index: Int) {
@@ -47,7 +68,45 @@ final class Store {
         save()
     }
 
-    private func save() { defaults.set(items, forKey: key) }
+    /// Rewrites a clip where it stands. Unlike add() it keeps its position — and so
+    /// its ⌘⇧⌃n — and carries its pin across to the new text. Addressed by text
+    /// rather than index: rows are rebuilt constantly and an index goes stale.
+    @discardableResult
+    func replace(_ old: String, with raw: String) -> SaveResult {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, items.contains(old) else { return .blank }
+        guard text != old else { return .saved }
+
+        let wasPinned = pins.contains(old)
+        // Renaming onto another clip's text absorbs it rather than duplicating.
+        if let twin = items.firstIndex(of: text) { items.remove(at: twin) }
+        // Re-find: that removal may have shifted everything left of it.
+        guard let slot = items.firstIndex(of: old) else { return .blank }
+        items[slot] = text
+        pins.remove(old)
+        if wasPinned { pins.insert(text) }
+        save()
+        return .saved
+    }
+
+    /// Reordering is how a clip gets a different ⌘⇧⌃n.
+    func move(from: Int, to: Int) {
+        guard items.indices.contains(from), items.indices.contains(to), from != to else { return }
+        items.insert(items.remove(at: from), at: to)
+        save()
+    }
+
+    func clear() {
+        items.removeAll()
+        pins.removeAll()
+        save()
+    }
+
+    private func save() {
+        pins.formIntersection(items)        // a pin on a gone clip is just litter
+        defaults.set(items, forKey: key)
+        defaults.set(Array(pins), forKey: pinKey)
+    }
 }
 
 // MARK: - Screen anchoring
@@ -78,6 +137,24 @@ enum Anchor: Int, CaseIterable {
                y: area.minY + max(0, area.height - size.height) * unit.y,
                width: size.width,
                height: size.height)
+    }
+
+    enum TuckSide { case left, right, down }
+
+    /// Which way this spot tucks away: toward the screen edge it's flush against.
+    /// A corner slides sideways rather than down — side edges win.
+    var tuckSide: TuckSide {
+        if unit.x == 0 { return .left }
+        if unit.x == 1 { return .right }
+        return .down                                // bottomMiddle
+    }
+
+    var tuckArrow: (hide: String, show: String) {
+        switch tuckSide {
+        case .left:  return ("chevron.left", "chevron.right")
+        case .right: return ("chevron.right", "chevron.left")
+        case .down:  return ("chevron.down", "chevron.up")
+        }
     }
 
     /// The shape in mid-drag, when the pill belongs to no anchor at all.

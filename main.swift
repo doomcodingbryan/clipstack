@@ -2,12 +2,6 @@ import AppKit
 import Carbon.HIToolbox
 import QuartzCore
 
-extension NSPasteboard.PasteboardType {
-    /// nspasteboard.org convention: password managers set this so clipboard
-    /// tools don't archive secrets. Cheaper than a setting nobody finds.
-    static let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
-}
-
 // MARK: - Bits of chrome
 
 func symbolButton(_ name: String, size: CGFloat = 12, describedAs: String? = nil,
@@ -93,9 +87,71 @@ final class ZoneView: NSView {
 /// A saved clip. The whole strip is the copy target — a far easier hit than the
 /// 22pt button it replaces, and the reclaimed width goes to the text.
 final class ClipRow: NSStackView {
-    var onClick: (() -> Void)?
+    static let rest: CGFloat = 0.09
+    private static let hover: CGFloat = 0.2
+    private static let pressed: CGFloat = 0.3
 
-    override func mouseDown(with event: NSEvent) { onClick?() }
+    /// Past this much vertical travel it stops being a click.
+    private static let dragThreshold: CGFloat = 4
+
+    var onClick: (() -> Void)?
+    var onEdit: (() -> Void)?
+    /// Total vertical travel on release, in points. Positive is up the list.
+    var onMove: ((CGFloat) -> Void)?
+
+    private var pressY: CGFloat = 0
+    private var reordering = false
+
+    // A click is mouse-*up* inside the row, the way every other clickable thing on
+    // macOS behaves: press and drag off and it cancels, rather than having already
+    // fired the moment you touched it. AppKit routes the drag and up events here
+    // because this view took the mouse-down.
+    override func mouseDown(with event: NSEvent) {
+        pressY = event.locationInWindow.y
+        reordering = false
+        shade(Self.pressed)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let dy = event.locationInWindow.y - pressY
+        if !reordering, abs(dy) > Self.dragThreshold {
+            reordering = true
+            layer?.zPosition = 1            // ride over its neighbours
+            shade(Self.pressed)
+        }
+        // Only the dragged row moves. Re-laying out the list mid-drag would destroy
+        // the very view holding the mouse; the list catches up on release.
+        if reordering { lift(dy) } else { shade(inside(event) ? Self.pressed : Self.rest) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        let dy = event.locationInWindow.y - pressY
+        lift(0)
+        layer?.zPosition = 0
+        if reordering {
+            reordering = false
+            shade(Self.rest)
+            onMove?(dy)
+            return
+        }
+        let hit = inside(event)
+        shade(hit ? Self.hover : Self.rest)      // still under the cursor? stay lit
+        // The first click of a double already copied. That's harmless, and the
+        // alternative is delaying every copy to wait for a second click.
+        if hit { event.clickCount >= 2 ? onEdit?() : onClick?() }
+    }
+
+    /// Instant, not animated — an implicit CA animation here would trail the cursor.
+    private func lift(_ dy: CGFloat) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        layer?.transform = CATransform3DMakeTranslation(0, dy, 0)
+        CATransaction.commit()
+    }
+
+    private func inside(_ event: NSEvent) -> Bool {
+        bounds.contains(convert(event.locationInWindow, from: nil))
+    }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -106,11 +162,38 @@ final class ClipRow: NSStackView {
                                        owner: self, userInfo: nil))
     }
 
-    override func mouseEntered(with event: NSEvent) { lit(true) }
-    override func mouseExited(with event: NSEvent) { lit(false) }
+    override func mouseEntered(with event: NSEvent) { shade(Self.hover) }
+    override func mouseExited(with event: NSEvent) { shade(Self.rest) }
 
-    private func lit(_ on: Bool) {
-        layer?.backgroundColor = NSColor.white.withAlphaComponent(on ? 0.2 : 0.09).cgColor
+    private func shade(_ alpha: CGFloat) {
+        layer?.backgroundColor = NSColor.white.withAlphaComponent(alpha).cgColor
+    }
+}
+
+/// Borderless panels refuse key status, and without it there is no keyboard input
+/// at all. The typing field needs it; `.nonactivatingPanel` still keeps a plain
+/// click on the pill from stealing focus from whatever you were working in.
+final class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+
+    /// An accessory app has no main menu, and the main menu is what normally
+    /// dispatches ⌘X/⌘C/⌘V/⌘A to the field editor. Without this the text box
+    /// silently swallows every one of them.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods == .command || mods == .control else {
+            return super.performKeyEquivalent(with: event)
+        }
+        let action: Selector?
+        switch event.charactersIgnoringModifiers?.lowercased() {
+        case "v":                        action = #selector(NSText.paste(_:))
+        case "c" where mods == .command: action = #selector(NSText.copy(_:))
+        case "x" where mods == .command: action = #selector(NSText.cut(_:))
+        case "a" where mods == .command: action = #selector(NSText.selectAll(_:))
+        default:                         action = nil
+        }
+        guard let action else { return super.performKeyEquivalent(with: event) }
+        return NSApp.sendAction(action, to: nil, from: self)
     }
 }
 
@@ -147,44 +230,66 @@ private enum Move {
 
 // MARK: - Global hotkey
 
-// Carbon's handler is a bare C function pointer, so the callback lives out here
-// instead of being captured. ponytail: one global for one hotkey — a keyed
-// registry is what you'd add on the day there's a second one.
-private var hotKeyAction: (() -> Void)?
-private var hotKeyRef: EventHotKeyRef?
+// Carbon's handler is a bare C function pointer, so these live out here instead of
+// being captured. The keyed registry the old one-hotkey global said it would need.
+private var hotKeyActions: [UInt32: () -> Void] = [:]
+private var hotKeyRefs: [EventHotKeyRef?] = []
+private var hotKeyHandlerInstalled = false
 
 /// Registers a system-wide hotkey. Carbon rather than NSEvent's global monitor
 /// on purpose: RegisterEventHotKey needs no Accessibility permission, so
 /// Clipstack never has to ask the user for one.
-private func registerHotKey(keyCode: UInt32, modifiers: UInt32, action: @escaping () -> Void) -> Bool {
-    hotKeyAction = action
+private func registerHotKey(id: UInt32, keyCode: UInt32, modifiers: UInt32,
+                            action: @escaping () -> Void) -> Bool {
+    hotKeyActions[id] = action
 
-    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
-                             eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-        hotKeyAction?()
-        return noErr
-    }, 1, &spec, nil, nil)
+    // One handler serves every hotkey — it reads back which one fired.
+    if !hotKeyHandlerInstalled {
+        hotKeyHandlerInstalled = true
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard),
+                                 eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            var fired = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                              EventParamType(typeEventHotKeyID), nil,
+                              MemoryLayout<EventHotKeyID>.size, nil, &fired)
+            hotKeyActions[fired.id]?()
+            return noErr
+        }, 1, &spec, nil, nil)
+    }
 
-    let id = EventHotKeyID(signature: OSType(0x434C5053), id: 1)   // 'CLPS'
-    return RegisterEventHotKey(keyCode, modifiers, id,
-                               GetApplicationEventTarget(), 0, &hotKeyRef) == noErr
+    var ref: EventHotKeyRef?
+    let ok = RegisterEventHotKey(keyCode, modifiers,
+                                 EventHotKeyID(signature: OSType(0x434C5053), id: id),
+                                 GetApplicationEventTarget(), 0, &ref) == noErr
+    if ok { hotKeyRefs.append(ref) }
+    return ok
 }
 
 // MARK: - App
 
 let collapsedSize = NSSize(width: 72, height: 48)   // insets + grip + count
+private let tuckOverlap: CGFloat = 8   // how far the little pill rides over the big one
 let expandedWidth: CGFloat = 360
 private let rowHeight: CGFloat = 40   // two lines of preview
 private let iconSide: CGFloat = 28
 private let gripWidth: CGFloat = 16
 private let expandedKey = "clipstack.expanded"
+private let tuckedKey = "clipstack.tucked"
 // ponytail: key string unchanged so an existing saved spot survives the rename.
 private let anchorKey = "clipstack.corner"
 // Cmd+Shift+Ctrl+V. Cmd+Shift+V is Paste and Match Style, which is not ours to take.
 private let hotKeyCode = UInt32(kVK_ANSI_V)
 private let hotKeyMods = UInt32(cmdKey | shiftKey | controlKey)
 private let hotKeyHint = "⌘⇧⌃V"
+private let clipChord = "⌘⇧⌃"
+/// Digit key codes are not contiguous, so they get spelled out. Position i picks
+/// clip i, with 0 in last place for the tenth — the browser-tab convention.
+private let clipKeyCodes: [UInt32] = [
+    UInt32(kVK_ANSI_1), UInt32(kVK_ANSI_2), UInt32(kVK_ANSI_3), UInt32(kVK_ANSI_4), UInt32(kVK_ANSI_5),
+    UInt32(kVK_ANSI_6), UInt32(kVK_ANSI_7), UInt32(kVK_ANSI_8), UInt32(kVK_ANSI_9), UInt32(kVK_ANSI_0),
+]
+private func clipShortcutLabel(_ index: Int) -> String { index == 9 ? "0" : "\(index + 1)" }
 
 private func fix(_ view: NSView, _ width: CGFloat, _ height: CGFloat) {
     view.translatesAutoresizingMaskIntoConstraints = false
@@ -194,7 +299,7 @@ private func fix(_ view: NSView, _ width: CGFloat, _ height: CGFloat) {
     ])
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSWindowDelegate {
     let store = Store()
     var panel: NSPanel!
     // Opens expanded the very first time so you can actually find it on screen;
@@ -204,6 +309,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // which is a valid Anchor and would swallow the default.
     var anchor = (UserDefaults.standard.object(forKey: anchorKey) as? Int)
         .flatMap(Anchor.init(rawValue:)) ?? .bottomRight
+    // bool(forKey:) is fine here — unset means false means not tucked.
+    var tucked = UserDefaults.standard.bool(forKey: tuckedKey)
 
     private var root: NSStackView!
     private var listStack: NSStackView!
@@ -211,11 +318,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var countLabel: NSTextField!
     private var flash: NSTextField!
     private var closeButton: NSButton!
+    private var grip: DragHandle!
+    private var tuckButton: NSButton!
+    private var tuckPanel: NSPanel!
+    private var input: NSTextField!
+    private var inputRow: NSStackView!
+    private var typing = false
+    /// The clip being rewritten. nil means a brand new one.
+    private var editing: String?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         NSApp.setActivationPolicy(.accessory)   // no Dock icon, no menu bar
 
-        panel = NSPanel(
+        panel = KeyPanel(
             contentRect: NSRect(origin: .zero, size: collapsedSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -227,6 +342,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.hasShadow = false     // its halo is square, so it reads as a box round the pill
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
+        panel.delegate = self       // for windowDidResignKey
 
         let backdrop = ClickToExpand()
         backdrop.onClick = { [weak self] in self?.setExpanded(true) }
@@ -241,15 +357,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Right-click anywhere to quit.
         let menu = NSMenu()
+        let clear = NSMenuItem(title: "Clear All Clips…", action: #selector(clearAll), keyEquivalent: "")
+        clear.target = self         // the delegate isn't reliably in the responder chain
+        menu.addItem(clear)
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Clipstack", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
         backdrop.menu = menu
 
         buildViews(in: backdrop)
+        buildTuckPanel()
         render()          // render() parks it in `anchor` via resizePanel
-        panel.orderFrontRegardless()
+        if !tucked { panel.orderFrontRegardless() }
+        raiseTuck()
 
-        if !registerHotKey(keyCode: hotKeyCode, modifiers: hotKeyMods, action: { [weak self] in
-            self?.saveFromHotKey()
+        // Clip pickers first, so a partial failure doesn't stop the main one.
+        let missed = clipKeyCodes.enumerated().filter { index, code in
+            !registerHotKey(id: UInt32(index + 2), keyCode: code, modifiers: hotKeyMods) { [weak self] in
+                self?.copyFromHotKey(index)
+            }
+        }
+        if !missed.isEmpty {
+            FileHandle.standardError.write("Clipstack: \(missed.count) of \(clipKeyCodes.count) clip shortcuts were already taken\n".data(using: .utf8)!)
+        }
+
+        if !registerHotKey(id: 1, keyCode: hotKeyCode, modifiers: hotKeyMods, action: { [weak self] in
+            self?.typeFromHotKey()
         }) {
             // Someone else owns the combo. Say so rather than failing silently.
             FileHandle.standardError.write("Clipstack: \(hotKeyHint) is already taken\n".data(using: .utf8)!)
@@ -258,7 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func buildViews(in container: NSView) {
-        let grip = DragHandle()
+        grip = DragHandle()
         grip.image = NSImage(systemSymbolName: "line.3.horizontal", accessibilityDescription: "Drag to move")?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
         grip.contentTintColor = NSColor.white.withAlphaComponent(0.45)
@@ -268,6 +400,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grip.onDragStart = { [weak self] in
             guard let self else { return }
             self.panel.contentView?.layer?.maskedCorners = Anchor.allCornersRounded
+            self.tuckPanel.orderOut(nil)        // no point trailing the pill mid-flight
             self.showZones(pill: self.panel.frame.size, over: self.panel.frame)
         }
         grip.onDrag = { [weak self] frame in
@@ -287,8 +420,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.55)
         fix(closeButton, iconSide, iconSide)
 
-        plusButton = symbolButton("plus.circle.fill", size: 16, target: self, action: #selector(saveClipboard))
-        plusButton.toolTip = "Save what's on the clipboard  (\(hotKeyHint))"
+        plusButton = symbolButton("plus.circle.fill", size: 16, target: self, action: #selector(openInput))
+        plusButton.toolTip = "Add a clip  (\(hotKeyHint))"
         fix(plusButton, iconSide, iconSide)
 
         countLabel = label("", size: 11, alpha: 0.55)
@@ -308,6 +441,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.alignment = .centerY
         header.distribution = .fill
 
+        input = NSTextField(string: "")
+        input.font = .systemFont(ofSize: 12)
+        input.textColor = .white
+        input.isBordered = false
+        input.focusRingType = .none
+        input.drawsBackground = false
+        input.placeholderAttributedString = NSAttributedString(
+            string: "Type a clip, ⏎ to save",
+            attributes: [.foregroundColor: NSColor.white.withAlphaComponent(0.35),
+                         .font: NSFont.systemFont(ofSize: 12)])
+        // Single-line mode centres the text in the cell; scrollable lets a long
+        // clip run past the right edge instead of clipping dead.
+        input.usesSingleLineMode = true
+        input.cell?.wraps = false
+        input.cell?.isScrollable = true
+        input.delegate = self               // for Escape
+        input.target = self
+        input.action = #selector(commitInput)   // fires on ⏎
+
+        // Wrapped so the text isn't flush against the rounded edge — NSTextField
+        // has no content inset, but a stack has edgeInsets.
+        // No fixed height on the field itself: left at its intrinsic one line, the
+        // text fills it exactly and .centerY does the centring. Forcing it taller
+        // just pins the text to the top of the cell.
+        inputRow = NSStackView(views: [input])
+        inputRow.orientation = .horizontal
+        inputRow.alignment = .centerY
+        inputRow.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
+        inputRow.distribution = .fill
+        // ponytail: explicit height, same reason as a clip row — edgeInsets don't
+        // survive being measured through the parent stack's fittingSize.
+        inputRow.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        inputRow.isHidden = true
+        inputRow.wantsLayer = true
+        inputRow.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        inputRow.layer?.cornerRadius = 7
+        inputRow.layer?.cornerCurve = .continuous
+
         listStack = NSStackView()
         listStack.orientation = .vertical
         listStack.spacing = 4
@@ -315,7 +486,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // List sits above the header so the pill itself stays put while the
         // panel grows upward off it.
-        root = NSStackView(views: [listStack, header])
+        // Field sits directly above the header, right where the + you pressed is.
+        root = NSStackView(views: [listStack, inputRow, header])
         root.orientation = .vertical
         root.spacing = 8
         root.alignment = .leading
@@ -328,6 +500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             listStack.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            inputRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
         ])
     }
 
@@ -335,12 +508,96 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func minimize() { setExpanded(false) }
 
+    @objc private func toggleTuck() {
+        tucked.toggle()
+        UserDefaults.standard.set(tucked, forKey: tuckedKey)
+        if tucked {
+            closeInput()
+            panel.orderOut(nil)
+        } else {
+            panel.orderFrontRegardless()
+        }
+        // resizePanel re-runs place(), which moves and re-points the little one.
+        resizePanel()
+        raiseTuck()
+    }
+
+    /// The arrow points at the edge the pill vanishes into, and back out once it
+    /// has. Re-pointed on every move too — dragging to another edge flips it.
+    private func updateTuckArrow() {
+        let arrow = anchor.tuckArrow
+        tuckButton.image = NSImage(systemSymbolName: tucked ? arrow.show : arrow.hide,
+                                   accessibilityDescription: tucked ? "Show the pill" : "Hide the pill")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
+        tuckButton.toolTip = tucked ? "Bring the pill back" : "Hide the pill against the edge"
+    }
+
+    /// A pill of its own, riding beside the big one on the side away from the edge
+    /// it tucks into — and taking its place at that edge once it's gone.
+    private func buildTuckPanel() {
+        tuckPanel = NSPanel(contentRect: NSRect(origin: .zero, size: NSSize(width: 24, height: 34)),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        tuckPanel.level = .floating
+        tuckPanel.isOpaque = false
+        tuckPanel.backgroundColor = .clear
+        tuckPanel.hasShadow = false
+        tuckPanel.hidesOnDeactivate = false
+        tuckPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        let blur = NSVisualEffectView()
+        blur.material = .hudWindow
+        blur.blendingMode = .behindWindow
+        blur.state = .active
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = 11
+        blur.layer?.cornerCurve = .continuous
+        blur.layer?.masksToBounds = true
+        blur.menu = panel.contentView?.menu       // right-click quits here too
+        tuckPanel.contentView = blur
+
+        tuckButton = symbolButton("chevron.right", size: 11, target: self, action: #selector(toggleTuck))
+        tuckButton.contentTintColor = NSColor.white.withAlphaComponent(0.75)
+        tuckButton.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(tuckButton)
+        NSLayoutConstraint.activate([
+            tuckButton.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            tuckButton.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            tuckButton.topAnchor.constraint(equalTo: blur.topAnchor),
+            tuckButton.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
+        ])
+    }
+
+    /// Kept above the big pill — they overlap now, and the arrow has to stay
+    /// visible and clickable. Tucked, the big one is ordered out, so its window
+    /// number is no longer a thing to sit above.
+    private func raiseTuck() {
+        if tucked { tuckPanel.orderFrontRegardless() }
+        else { tuckPanel.order(.above, relativeTo: panel.windowNumber) }
+    }
+
+    /// Where the little pill sits for a big pill at `pill`.
+    private func tuckFrame(beside pill: NSRect) -> NSRect {
+        let size = anchor.tuckSide == .down ? NSSize(width: 34, height: 24) : NSSize(width: 24, height: 34)
+        if tucked, let area = area(under: NSPoint(x: pill.midX, y: pill.midY)) {
+            return anchor.frame(for: size, in: area)
+        }
+        switch anchor.tuckSide {
+        case .left:  return NSRect(x: pill.maxX - tuckOverlap, y: pill.midY - size.height / 2,
+                                   width: size.width, height: size.height)
+        case .right: return NSRect(x: pill.minX + tuckOverlap - size.width, y: pill.midY - size.height / 2,
+                                   width: size.width, height: size.height)
+        case .down:  return NSRect(x: pill.midX - size.width / 2, y: pill.maxY - tuckOverlap,
+                                   width: size.width, height: size.height)
+        }
+    }
+
     private func setExpanded(_ on: Bool) {
         guard expanded != on else { return }
         expanded = on
         UserDefaults.standard.set(on, forKey: expandedKey)
 
         guard on else {
+            closeInput()        // no field to type into once it's folded away
             // Fade the rows out *before* tearing them down, or they blink out of
             // existence a beat ahead of the box that's supposed to contain them.
             NSAnimationContext.runAnimationGroup({ ctx in
@@ -354,28 +611,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         render()
     }
 
-    /// The hotkey opens the shelf before saving: every scrap of feedback we have
-    /// — the flash, the count, the new row — is hidden while collapsed, so
-    /// saving without expanding would be completely silent.
-    private func saveFromHotKey() {
+    /// Opens the shelf and drops straight into the field — the field being the only
+    /// way anything gets in now.
+    private func typeFromHotKey() {
         setExpanded(true)
         panel.orderFrontRegardless()
-        saveClipboard()
+        openInput()
     }
 
-    @objc private func saveClipboard() {
-        let pb = NSPasteboard.general
-        let types = pb.types ?? []
-        switch clipAction(concealed: types.contains(.concealed),
-                          hasContents: !types.isEmpty,
-                          string: pb.string(forType: .string)) {
-        case .skip(let why):
-            show(flash: why)
-        case .save(let text):
-            guard store.add(text) else { return show(flash: "already saved") }
+    /// Opens the typing field. Clips only ever come from here.
+    @objc private func openInput() { beginInput(on: nil) }
+
+    /// - Parameter clip: the text to rewrite, or nil to write a new one.
+    private func beginInput(on clip: String?) {
+        editing = clip
+        input.stringValue = clip ?? ""
+        typing = true
+        clearFlash()        // a stale "copied" next to an open editor reads as a result
+        render()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.makeFirstResponder(input)
+        if clip != nil { input.currentEditor()?.selectAll(nil) }
+    }
+
+    @objc private func commitInput() {
+        let text = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rewriting = editing
+        closeInput()
+        // An edit keeps its slot, so nothing slides in at the top for it.
+        switch rewriting.map({ store.replace($0, with: text) }) ?? store.add(text) {
+        case .blank:
+            return                                      // back out quietly
+        case .full:
+            show(flash: "shelf full — unpin or delete one", for: 2.6)
+        case .movedUp:
+            // Otherwise a duplicate looks like a no-op: the count doesn't move and
+            // the row it "added" was already there.
             render(newRow: true)
-            show(flash: text, for: 2.2)     // read back exactly what got saved
+            show(flash: "already saved — moved up", for: 2.2)
+        case .saved:
+            render(newRow: rewriting == nil)
+            show(flash: text, for: 2.2)
+        case .evicted(let gone):
+            render(newRow: true)
+            show(flash: "saved — dropped “\(gone)”", for: 2.6)
         }
+    }
+
+    /// - Parameter returningFocus: false when the field is closing *because* focus
+    ///   already left — deactivating again there would be shoving an open door.
+    private func closeInput(returningFocus: Bool = true) {
+        // Also the re-entrancy guard: closing resigns key, which calls back in here.
+        guard typing else { return }
+        typing = false
+        editing = nil
+        input.stringValue = ""
+        panel.makeFirstResponder(nil)
+        if returningFocus { NSApp.deactivate() }
+        render()
+    }
+
+    /// Clicked away mid-type. Without this the box hangs open with half a clip in
+    /// it until you come back and press ⏎ or Escape. Discards, same as Escape.
+    func windowDidResignKey(_ note: Notification) {
+        closeInput(returningFocus: false)
+    }
+
+    /// Escape backs out without saving.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(NSResponder.cancelOperation(_:)) {
+            closeInput()
+            return true
+        }
+        // The field editor turns ⌃V into emacs pageDown, which is nothing at all in
+        // a one-line box. Catch it here so ⌃V pastes too.
+        if selector == #selector(NSResponder.pageDown(_:)) {
+            textView.paste(nil)
+            return true
+        }
+        return false
+    }
+
+    /// Whatever app you're in, ⌘⇧⌃n puts clip n on the pasteboard ready to paste.
+    private func copyFromHotKey(_ index: Int) {
+        guard store.items.indices.contains(index) else { return }
+        copy(index)
     }
 
     private func copy(_ index: Int) {
@@ -383,6 +704,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(store.items[index], forType: .string)
         show(flash: "copied")
+    }
+
+    @objc private func togglePin(_ sender: NSButton) {
+        store.togglePin(sender.tag)
+        render()
+    }
+
+    /// A row dragged `dy` points lands that many row-heights away. Up the screen is
+    /// toward index 0, so the travel subtracts.
+    private func moveRow(_ index: Int, by dy: CGFloat) {
+        let step = rowHeight + listStack.spacing
+        let target = max(0, min(store.items.count - 1, index - Int((dy / step).rounded())))
+        guard target != index else { return }
+        store.move(from: index, to: target)
+        render()
+    }
+
+    @objc private func clearAll() {
+        let alert = NSAlert()
+        alert.messageText = "Clear all clips?"
+        alert.informativeText = "All \(store.items.count) clips, pinned ones included, will be deleted. This can't be undone."
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        store.clear()
+        render()
     }
 
     @objc private func deleteRow(_ sender: NSButton) {
@@ -412,6 +760,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             })
         }
     }
+    private func clearFlash() {
+        flashToken = ""             // cancels any fade still pending
+        flash.stringValue = ""
+        flash.alphaValue = 0
+    }
     private var flashToken = ""
     /// The first layout has no previous frame to animate from.
     private var hasLaidOut = false
@@ -427,12 +780,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         flash.isHidden = !expanded
         listStack.isHidden = !expanded
         closeButton.isHidden = !expanded
+        inputRow.isHidden = !(expanded && typing)
         // Bare count when collapsed — it's all the pill has room to say.
         countLabel.stringValue = expanded ? "\(store.items.count)/\(maxItems)" : "\(store.items.count)"
 
         if expanded {
             if store.items.isEmpty {
-                let hint = label("Copy something, then hit + or \(hotKeyHint)", size: 11, alpha: 0.45)
+                let hint = label("Hit + or \(hotKeyHint) to write a clip", size: 11, alpha: 0.45)
                 listStack.addArrangedSubview(hint)
             }
             for (index, text) in store.items.enumerated() {
@@ -475,14 +829,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
         preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        let number = label(clipShortcutLabel(index), size: 10, alpha: 0.38)
+        number.alignment = .center
+        number.toolTip = "\(clipChord)\(clipShortcutLabel(index)) copies this clip"
+        fix(number, 13, 20)
+
+        let held = store.isPinned(text)
+        let pin = symbolButton(held ? "pin.fill" : "pin", size: 10,
+                               describedAs: held ? "Unpin" : "Pin",
+                               target: self, action: #selector(togglePin(_:)))
+        pin.tag = index
+        pin.contentTintColor = NSColor.white.withAlphaComponent(held ? 0.85 : 0.28)
+        pin.toolTip = held ? "Unpin — it can be dropped again" : "Pin — never dropped to make room"
+        fix(pin, 18, 20)
+
         let trash = symbolButton("xmark", size: 10, target: self, action: #selector(deleteRow(_:)))
         trash.tag = index
         trash.contentTintColor = NSColor.white.withAlphaComponent(0.45)
         trash.toolTip = "Delete"
         fix(trash, 18, 20)
 
-        let stack = ClipRow(views: [preview, trash])
+        let stack = ClipRow(views: [number, preview, pin, trash])
         stack.onClick = { [weak self] in self?.copy(index) }
+        stack.onMove = { [weak self] dy in self?.moveRow(index, by: dy) }
+        stack.onEdit = { [weak self] in self?.beginInput(on: text) }
         stack.orientation = .horizontal
         stack.spacing = 6
         stack.alignment = .centerY
@@ -491,11 +861,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stack.distribution = .fill
         // ponytail: explicit row height — NSStackView.edgeInsets doesn't survive
         // being measured through a parent stack's fittingSize, rows come out 16pt.
-        stack.toolTip = text        // the untruncated text, on the row not the label
+        stack.toolTip = "\(text)\n\nDouble-click to edit"   // and the untruncated text, free
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 6)
         stack.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
         stack.wantsLayer = true
-        stack.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.09).cgColor
+        stack.layer?.backgroundColor = NSColor.white.withAlphaComponent(ClipRow.rest).cgColor
         stack.layer?.cornerRadius = 7
         stack.layer?.cornerCurve = .continuous
         return stack
@@ -530,11 +900,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func place(_ target: NSRect, on spot: Anchor, _ move: Move) {
         anchor = spot
         panel.contentView?.layer?.maskedCorners = spot.roundedCorners
-        guard move != .cut else { return panel.setFrame(target, display: true) }
+        updateTuckArrow()       // a new edge means a new direction to point in
+        let tuck = tuckFrame(beside: target)
+        // Squared off only when it's the one sitting in the edge.
+        tuckPanel?.contentView?.layer?.maskedCorners = tucked ? spot.roundedCorners : Anchor.allCornersRounded
+        guard move != .cut else {
+            panel.setFrame(target, display: true)
+            tuckPanel?.setFrame(tuck, display: true)
+            return
+        }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = move.duration
             ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             self.panel.animator().setFrame(target, display: true)
+            self.tuckPanel?.animator().setFrame(tuck, display: true)
             if move == .unfold { self.listStack.animator().alphaValue = 1 }
         }
     }
@@ -601,6 +980,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let area = area(under: middle) else { return }
         let landed = Anchor.nearest(to: panel.frame, in: area)
         place(landed.frame(for: panel.frame.size, in: area), on: landed, .settle)
+        raiseTuck()
         UserDefaults.standard.set(landed.rawValue, forKey: anchorKey)
     }
 }
