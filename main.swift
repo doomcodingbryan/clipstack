@@ -24,6 +24,8 @@ final class DragHandle: NSImageView {
     var onDragStart: (() -> Void)?
     var onDrag: ((NSRect) -> Void)?
     var onDragEnd: (() -> Void)?
+    /// Pressed and released without moving. Lets one view be both button and handle.
+    var onClick: (() -> Void)?
 
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
@@ -40,8 +42,7 @@ final class DragHandle: NSImageView {
             onDrag?(NSRect(x: mouse.x - grab.x, y: mouse.y - grab.y,
                            width: size.width, height: size.height))
         }
-        // A plain click on the grip isn't a drag — nothing to fall back from.
-        if dragged { onDragEnd?() }
+        if dragged { onDragEnd?() } else { onClick?() }
     }
 }
 
@@ -319,7 +320,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var flash: NSTextField!
     private var closeButton: NSButton!
     private var grip: DragHandle!
-    private var tuckButton: NSButton!
+    private var tuckHandle: DragHandle!
     private var tuckPanel: NSPanel!
     private var input: NSTextField!
     private var inputRow: NSStackView!
@@ -355,14 +356,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         backdrop.layer?.masksToBounds = true
         panel.contentView = backdrop
 
-        // Right-click anywhere to quit.
-        let menu = NSMenu()
-        let clear = NSMenuItem(title: "Clear All Clips…", action: #selector(clearAll), keyEquivalent: "")
-        clear.target = self         // the delegate isn't reliably in the responder chain
-        menu.addItem(clear)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Clipstack", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
-        backdrop.menu = menu
+        // Right-click anywhere — including on a clip — reaches these.
+        backdrop.menu = makeMenu()
 
         buildViews(in: backdrop)
         buildTuckPanel()
@@ -409,8 +404,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             self.showZones(pill: frame.size, over: frame)
         }
         grip.onDragEnd = { [weak self] in
-            self?.hideZones()
-            self?.settle()
+            guard let self else { return }
+            self.hideZones()
+            self.settle(from: self.panel.frame)
         }
         fix(grip, gripWidth, iconSide)
 
@@ -508,7 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     @objc private func minimize() { setExpanded(false) }
 
-    @objc private func toggleTuck() {
+    private func toggleTuck() {
         tucked.toggle()
         UserDefaults.standard.set(tucked, forKey: tuckedKey)
         if tucked {
@@ -526,10 +522,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     /// has. Re-pointed on every move too — dragging to another edge flips it.
     private func updateTuckArrow() {
         let arrow = anchor.tuckArrow
-        tuckButton.image = NSImage(systemSymbolName: tucked ? arrow.show : arrow.hide,
+        tuckHandle.image = NSImage(systemSymbolName: tucked ? arrow.show : arrow.hide,
                                    accessibilityDescription: tucked ? "Show the pill" : "Hide the pill")?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
-        tuckButton.toolTip = tucked ? "Bring the pill back" : "Hide the pill against the edge"
+        tuckHandle.toolTip = tucked ? "Bring the pill back — drag to move it"
+                                    : "Hide the pill against the edge — drag to move it"
     }
 
     /// A pill of its own, riding beside the big one on the side away from the edge
@@ -555,17 +552,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         blur.menu = panel.contentView?.menu       // right-click quits here too
         tuckPanel.contentView = blur
 
-        tuckButton = symbolButton("chevron.right", size: 11, target: self, action: #selector(toggleTuck))
-        tuckButton.contentTintColor = NSColor.white.withAlphaComponent(0.75)
-        tuckButton.translatesAutoresizingMaskIntoConstraints = false
-        blur.addSubview(tuckButton)
+        tuckHandle = DragHandle()
+        tuckHandle.imageAlignment = .alignCenter
+        tuckHandle.contentTintColor = NSColor.white.withAlphaComponent(0.75)
+        tuckHandle.menu = blur.menu
+        tuckHandle.onClick = { [weak self] in self?.toggleTuck() }
+        tuckHandle.onDragStart = { [weak self] in
+            guard let self else { return }
+            let loose = Anchor.allCornersRounded         // airborne: nothing squared off
+            self.panel.contentView?.layer?.maskedCorners = loose
+            self.tuckPanel.contentView?.layer?.maskedCorners = loose
+            self.showZones(pill: self.anchoredFrame.size, over: self.anchoredFrame)
+        }
+        tuckHandle.onDrag = { [weak self] frame in
+            guard let self else { return }
+            // Untucked, the big pill is still the thing being positioned — carry it
+            // along by the same delta so the pair travels as one.
+            let dx = frame.minX - self.tuckPanel.frame.minX
+            let dy = frame.minY - self.tuckPanel.frame.minY
+            self.tuckPanel.setFrame(frame, display: true)
+            if !self.tucked {
+                self.panel.setFrame(self.panel.frame.offsetBy(dx: dx, dy: dy), display: true)
+            }
+            self.showZones(pill: self.anchoredFrame.size, over: self.anchoredFrame)
+        }
+        tuckHandle.onDragEnd = { [weak self] in
+            guard let self else { return }
+            self.hideZones()
+            self.settle(from: self.anchoredFrame)
+        }
+        tuckHandle.translatesAutoresizingMaskIntoConstraints = false
+        blur.addSubview(tuckHandle)
         NSLayoutConstraint.activate([
-            tuckButton.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
-            tuckButton.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
-            tuckButton.topAnchor.constraint(equalTo: blur.topAnchor),
-            tuckButton.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
+            tuckHandle.leadingAnchor.constraint(equalTo: blur.leadingAnchor),
+            tuckHandle.trailingAnchor.constraint(equalTo: blur.trailingAnchor),
+            tuckHandle.topAnchor.constraint(equalTo: blur.topAnchor),
+            tuckHandle.bottomAnchor.constraint(equalTo: blur.bottomAnchor),
         ])
     }
+
+    /// Whichever pill is actually on screen doing the anchoring.
+    private var anchoredFrame: NSRect { tucked ? tuckPanel.frame : panel.frame }
 
     /// Kept above the big pill — they overlap now, and the arrow has to stay
     /// visible and clickable. Tucked, the big one is ordered out, so its window
@@ -721,6 +748,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         render()
     }
 
+    /// Clear All and Quit, built fresh each time: an NSMenuItem belongs to one menu,
+    /// so rows can't share the pill's instances.
+    private func baseMenuItems() -> [NSMenuItem] {
+        let clear = NSMenuItem(title: "Clear All Clips…", action: #selector(clearAll), keyEquivalent: "")
+        clear.target = self         // the delegate isn't reliably in the responder chain
+        let quit = NSMenuItem(title: "Quit Clipstack", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        return [clear, .separator(), quit]
+    }
+
+    private func makeMenu() -> NSMenu {
+        let menu = NSMenu()
+        baseMenuItems().forEach(menu.addItem)
+        return menu
+    }
+
+    /// A clip's own menu. Carries the global items too, so no part of the pill is a
+    /// dead zone for right-click.
+    private func rowMenu(for text: String) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(clipItem("Edit…", #selector(editClip(_:)), text))
+        menu.addItem(clipItem(store.isPinned(text) ? "Unpin" : "Pin", #selector(pinClip(_:)), text))
+        menu.addItem(clipItem("Delete", #selector(deleteClip(_:)), text))
+        menu.addItem(.separator())
+        baseMenuItems().forEach(menu.addItem)
+        return menu
+    }
+
+    /// Carries the clip's text, not its row index — an index goes stale the moment
+    /// anything re-renders, and then the menu acts on the wrong clip.
+    private func clipItem(_ title: String, _ action: Selector, _ text: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.representedObject = text
+        return item
+    }
+
+    @objc private func editClip(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String else { return }
+        beginInput(on: text)
+    }
+
+    @objc private func pinClip(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String,
+              let index = store.items.firstIndex(of: text) else { return }
+        store.togglePin(index)
+        render()
+    }
+
+    @objc private func deleteClip(_ sender: NSMenuItem) {
+        guard let text = sender.representedObject as? String,
+              let index = store.items.firstIndex(of: text) else { return }
+        store.remove(index)
+        render()
+    }
+
     @objc private func clearAll() {
         let alert = NSAlert()
         alert.messageText = "Clear all clips?"
@@ -849,7 +932,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         trash.toolTip = "Delete"
         fix(trash, 18, 20)
 
+        let menu = rowMenu(for: text)
+        pin.menu = menu             // NSControls swallow right-clicks; give them one
+        trash.menu = menu
+
         let stack = ClipRow(views: [number, preview, pin, trash])
+        stack.menu = menu
         stack.onClick = { [weak self] in self?.copy(index) }
         stack.onMove = { [weak self] dy in self?.moveRow(index, by: dy) }
         stack.onEdit = { [weak self] in self?.beginInput(on: text) }
@@ -973,12 +1061,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         })
     }
 
-    /// Let go: fall to the spot nearest wherever the pill was dropped, on whichever
-    /// screen it was dropped on.
-    private func settle() {
-        let middle = NSPoint(x: panel.frame.midX, y: panel.frame.midY)
-        guard let area = area(under: middle) else { return }
-        let landed = Anchor.nearest(to: panel.frame, in: area)
+    /// Let go: fall to the spot nearest where it was dropped, on whichever screen it
+    /// was dropped on. `moved` is whichever pill was under the cursor.
+    private func settle(from moved: NSRect) {
+        // Tucked, the big pill is hidden and parked wherever it was last left —
+        // possibly a different screen. Bring it along or area(under:) resolves
+        // against a stale position and it lands back where it started.
+        if tucked {
+            panel.setFrame(NSRect(origin: moved.origin, size: panel.frame.size), display: false)
+        }
+        guard let area = area(under: NSPoint(x: moved.midX, y: moved.midY)) else { return }
+        let landed = Anchor.nearest(to: moved, in: area)
         place(landed.frame(for: panel.frame.size, in: area), on: landed, .settle)
         raiseTuck()
         UserDefaults.standard.set(landed.rawValue, forKey: anchorKey)
