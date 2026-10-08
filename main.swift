@@ -4,15 +4,37 @@ import QuartzCore
 
 // MARK: - Bits of chrome
 
+/// ponytail: AppKit hands the click that makes a background window key to the
+/// window, not the view under it — so without this the pill eats the first click
+/// on every button whenever it isn't frontmost, which is right after every save
+/// (closeInput deactivates us) and any time you come back from another app.
+private final class FirstMouseButton: NSButton {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 func symbolButton(_ name: String, size: CGFloat = 12, describedAs: String? = nil,
                   target: AnyObject, action: Selector) -> NSButton {
     let config = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
     let image = NSImage(systemSymbolName: name, accessibilityDescription: describedAs)?
         .withSymbolConfiguration(config)
-    let button = NSButton(image: image ?? NSImage(), target: target, action: action)
+    let button = FirstMouseButton(image: image ?? NSImage(), target: target, action: action)
     button.isBordered = false
     button.bezelStyle = .regularSquare
     button.contentTintColor = .white
+    return button
+}
+
+/// Same borderless look as symbolButton, with a word instead of a glyph.
+/// attributedTitle, not contentTintColor — that one only tints images.
+func textButton(_ title: String, size: CGFloat = 11, alpha: CGFloat = 0.55,
+                target: AnyObject, action: Selector) -> NSButton {
+    let button = FirstMouseButton(title: title, target: target, action: action)
+    button.isBordered = false
+    button.bezelStyle = .regularSquare
+    button.attributedTitle = NSAttributedString(
+        string: title,
+        attributes: [.foregroundColor: NSColor.white.withAlphaComponent(alpha),
+                     .font: NSFont.systemFont(ofSize: size)])
     return button
 }
 
@@ -88,6 +110,8 @@ final class ZoneView: NSView {
 /// A saved clip. The whole strip is the copy target — a far easier hit than the
 /// 22pt button it replaces, and the reclaimed width goes to the text.
 final class ClipRow: NSStackView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     static let rest: CGFloat = 0.09
     private static let hover: CGFloat = 0.2
     private static let pressed: CGFloat = 0.3
@@ -319,6 +343,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     private var countLabel: NSTextField!
     private var flash: NSTextField!
     private var closeButton: NSButton!
+    private var clearButton: NSButton!
+    private var confirmRow: NSStackView!
+    private var confirmLabel: NSTextField!
+    /// "Clear all" pressed, waiting on the yes/no in `confirmRow`.
+    private var confirming = false
     private var grip: DragHandle!
     private var tuckHandle: DragHandle!
     private var tuckPanel: NSPanel!
@@ -410,11 +439,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         }
         fix(grip, gripWidth, iconSide)
 
-        closeButton = symbolButton("xmark", size: 11, describedAs: "Minimize",
+        // The shrink glyph, not an ✕: this folds the shelf back into the pill, it
+        // doesn't close or quit anything, and ✕ promises one of those.
+        closeButton = symbolButton("arrow.down.right.and.arrow.up.left", size: 10,
+                                   describedAs: "Minimize",
                                    target: self, action: #selector(minimize))
         closeButton.toolTip = "Minimize"
         closeButton.contentTintColor = NSColor.white.withAlphaComponent(0.55)
         fix(closeButton, iconSide, iconSide)
+
+        // Same confirm alert the right-click item uses — this is just a way to
+        // reach it without knowing the menu is there.
+        clearButton = textButton("Clear all", target: self, action: #selector(clearAll))
+        clearButton.toolTip = "Clear all clips"
 
         plusButton = symbolButton("plus.circle.fill", size: 16, target: self, action: #selector(openInput))
         plusButton.toolTip = "Add a clip  (\(hotKeyHint))"
@@ -431,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
 
-        let header = NSStackView(views: [grip, plusButton, countLabel, spacer, flash, closeButton])
+        let header = NSStackView(views: [grip, plusButton, countLabel, spacer, flash, clearButton, closeButton])
         header.orientation = .horizontal
         header.spacing = 8
         header.alignment = .centerY
@@ -455,6 +492,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         input.delegate = self               // for Escape
         input.target = self
         input.action = #selector(commitInput)   // fires on ⏎
+        // ⏎ fires the action regardless; this only stops it firing a *second* time
+        // when the field loses the editor. closeInput's makeFirstResponder(nil) is
+        // re-entrant inside the ⏎ callback and never lands, so the field editor stays
+        // attached — and the next openInput reclaims it, ends editing, and commits
+        // again, closing the box the instant it opened. That's the "+ does nothing
+        // after the first clip" bug. It also made clicking away save, not discard.
+        input.cell?.sendsActionOnEndEditing = false
 
         // Wrapped so the text isn't flush against the rounded edge — NSTextField
         // has no content inset, but a stack has edgeInsets.
@@ -475,6 +519,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         inputRow.layer?.cornerRadius = 7
         inputRow.layer?.cornerCurve = .continuous
 
+        // Our own confirm instead of an NSAlert: a system modal steals focus, drags
+        // the app to the front and looks nothing like the pill it's asking about.
+        confirmLabel = label("", size: 12, alpha: 0.92)
+        let confirmYes = textButton("Clear", alpha: 0.95, target: self, action: #selector(confirmClear))
+        let confirmNo = textButton("Cancel", target: self, action: #selector(cancelClear))
+        let confirmSpacer = NSView()
+        confirmSpacer.setContentHuggingPriority(.init(1), for: .horizontal)
+
+        // Same reason as the header's flash: a hidden row still ties its width to
+        // root, so anything in here that refuses to compress keeps the *collapsed*
+        // pill propped open wide enough to spell "Cancel".
+        [confirmLabel!, confirmYes, confirmNo].forEach {
+            $0.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        }
+
+        confirmRow = NSStackView(views: [confirmLabel, confirmSpacer, confirmYes, confirmNo])
+        confirmRow.orientation = .horizontal
+        confirmRow.alignment = .centerY
+        confirmRow.spacing = 10
+        confirmRow.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 0, right: 8)
+        confirmRow.distribution = .fill
+        confirmRow.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        confirmRow.isHidden = true
+        confirmRow.wantsLayer = true
+        confirmRow.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        confirmRow.layer?.cornerRadius = 7
+        confirmRow.layer?.cornerCurve = .continuous
+
         listStack = NSStackView()
         listStack.orientation = .vertical
         listStack.spacing = 4
@@ -483,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // List sits above the header so the pill itself stays put while the
         // panel grows upward off it.
         // Field sits directly above the header, right where the + you pressed is.
-        root = NSStackView(views: [listStack, inputRow, header])
+        root = NSStackView(views: [listStack, inputRow, confirmRow, header])
         root.orientation = .vertical
         root.spacing = 8
         root.alignment = .leading
@@ -497,6 +569,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
             listStack.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
             inputRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
+            confirmRow.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -24),
         ])
     }
 
@@ -625,6 +698,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
         guard on else {
             closeInput()        // no field to type into once it's folded away
+            cancelClear()
             // Fade the rows out *before* tearing them down, or they blink out of
             // existence a beat ahead of the box that's supposed to contain them.
             NSAnimationContext.runAnimationGroup({ ctx in
@@ -651,11 +725,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// - Parameter clip: the text to rewrite, or nil to write a new one.
     private func beginInput(on clip: String?) {
+        cancelClear()           // the confirm and the field share that slot
         editing = clip
         input.stringValue = clip ?? ""
         typing = true
         clearFlash()        // a stale "copied" next to an open editor reads as a result
-        render()
+        render(instant: true)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(input)
@@ -695,13 +770,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         editing = nil
         input.stringValue = ""
         panel.makeFirstResponder(nil)
-        if returningFocus { NSApp.deactivate() }
-        render()
+        // ponytail: deliberately not deactivating. Handing focus back here left
+        // the app inactive, and macOS won't reliably hand key status back to an
+        // accessory app's panel on the next open — the box came up visible but
+        // non-key, so it drew no caret and ate what you typed. Staying active
+        // costs you the focus return; it buys a field that works every time.
+        _ = returningFocus
+        render(instant: true)
     }
 
     /// Clicked away mid-type. Without this the box hangs open with half a clip in
     /// it until you come back and press ⏎ or Escape. Discards, same as Escape.
-    func windowDidResignKey(_ note: Notification) {
+    ///
+    /// ponytail: keyed off the *app* going inactive, not the panel losing key.
+    /// Panel key status flickers while our own activation settles, and closing on
+    /// that shut the box the moment it opened — which is why the field never
+    /// showed up again after the first clip. App-active only changes when you
+    /// really do go somewhere else, which is what this was always trying to mean.
+    func applicationDidResignActive(_ note: Notification) {
         closeInput(returningFocus: false)
     }
 
@@ -733,10 +819,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         show(flash: "copied")
     }
 
-    @objc private func togglePin(_ sender: NSButton) {
-        store.togglePin(sender.tag)
-        render()
-    }
 
     /// A row dragged `dy` points lands that many row-heights away. Up the screen is
     /// toward index 0, so the travel subtracts.
@@ -805,15 +887,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
     }
 
     @objc private func clearAll() {
-        let alert = NSAlert()
-        alert.messageText = "Clear all clips?"
-        alert.informativeText = "All \(store.items.count) clips, pinned ones included, will be deleted. This can't be undone."
-        alert.addButton(withTitle: "Clear")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard !store.items.isEmpty else { return }
+        closeInput()            // one row at a time in that slot
+        setExpanded(true)       // the menu can reach this while folded away
+        confirming = true
+        let n = store.items.count
+        confirmLabel.stringValue = "Delete all \(n) clip\(n == 1 ? "" : "s")?"
+        render(instant: true)
+    }
+
+    @objc private func cancelClear() {
+        guard confirming else { return }
+        confirming = false
+        render(instant: true)
+    }
+
+    @objc private func confirmClear() {
+        cancelClear()
         store.clear()
         render()
+        show(flash: "cleared")
     }
 
     @objc private func deleteRow(_ sender: NSButton) {
@@ -857,15 +950,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     // MARK: Render
 
-    private func render(newRow: Bool = false) {
+    /// - Parameter instant: skip the resize animation. The typing box opening and
+    ///   closing shifts the whole list up and back; sliding that is just noise.
+    private func render(newRow: Bool = false, instant: Bool = false) {
         listStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         plusButton.isHidden = !expanded
         flash.isHidden = !expanded
         listStack.isHidden = !expanded
         closeButton.isHidden = !expanded
+        clearButton.isHidden = !expanded || store.items.isEmpty     // nothing to clear
         inputRow.isHidden = !(expanded && typing)
+        confirmRow.isHidden = !(expanded && confirming)
         // Bare count when collapsed — it's all the pill has room to say.
-        countLabel.stringValue = expanded ? "\(store.items.count)/\(maxItems)" : "\(store.items.count)"
+        countLabel.stringValue = expanded ? "" : "\(store.items.count)"
 
         if expanded {
             if store.items.isEmpty {
@@ -896,7 +993,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
             }
         }
 
-        resizePanel()
+        resizePanel(instant: instant)
     }
 
     private func row(index: Int, text: String) -> NSView {
@@ -912,31 +1009,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         preview.setContentHuggingPriority(.defaultLow, for: .horizontal)
         preview.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        let number = label(clipShortcutLabel(index), size: 10, alpha: 0.38)
-        number.alignment = .center
-        number.toolTip = "\(clipChord)\(clipShortcutLabel(index)) copies this clip"
-        fix(number, 13, 20)
+        // ponytail: no number label — \(clipChord)1–0 still copy by position,
+        // the tooltip on the preview is where that's discoverable now.
+        preview.toolTip = "\(clipChord)\(clipShortcutLabel(index)) copies this clip"
 
-        let held = store.isPinned(text)
-        let pin = symbolButton(held ? "pin.fill" : "pin", size: 10,
-                               describedAs: held ? "Unpin" : "Pin",
-                               target: self, action: #selector(togglePin(_:)))
-        pin.tag = index
-        pin.contentTintColor = NSColor.white.withAlphaComponent(held ? 0.85 : 0.28)
-        pin.toolTip = held ? "Unpin — it can be dropped again" : "Pin — never dropped to make room"
-        fix(pin, 18, 20)
-
-        let trash = symbolButton("xmark", size: 10, target: self, action: #selector(deleteRow(_:)))
+        // A trash can: "destroy this clip" gets a glyph nothing else in the header
+        // shares, so it can't be mistaken for folding the shelf away.
+        let trash = symbolButton("trash", size: 10, describedAs: "Delete this clip",
+                                 target: self, action: #selector(deleteRow(_:)))
         trash.tag = index
         trash.contentTintColor = NSColor.white.withAlphaComponent(0.45)
-        trash.toolTip = "Delete"
+        trash.toolTip = "Delete this clip"
         fix(trash, 18, 20)
 
         let menu = rowMenu(for: text)
-        pin.menu = menu             // NSControls swallow right-clicks; give them one
-        trash.menu = menu
+        trash.menu = menu           // NSControls swallow right-clicks; give them one
 
-        let stack = ClipRow(views: [number, preview, pin, trash])
+        let stack = ClipRow(views: [preview, trash])
         stack.menu = menu
         stack.onClick = { [weak self] in self?.copy(index) }
         stack.onMove = { [weak self] dy in self?.moveRow(index, by: dy) }
@@ -961,7 +1050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
 
     /// Resizes in place and re-parks on the current anchor, so the panel grows
     /// away from whichever screen edges it's pinned to.
-    private func resizePanel() {
+    private func resizePanel(instant: Bool = false) {
         let start = panel.frame
         guard let area = area(under: NSPoint(x: start.midX, y: start.midY)) else { return }
         let width = expanded ? expandedWidth : collapsedSize.width
@@ -980,7 +1069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegate, N
         // from — leave it in place and the width snaps while only the height eases.
         panel.setFrame(start, display: false)
         place(anchor.frame(for: NSSize(width: width, height: height), in: area),
-              on: anchor, hasLaidOut ? .unfold : .cut)
+              on: anchor, (hasLaidOut && !instant) ? .unfold : .cut)
         hasLaidOut = true
     }
 
